@@ -1,9 +1,35 @@
 # Visual Studio 2015 cache/options directory
 .vs/
 .idea/
+.tools/
 build/
 _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
 CMakeUserPresets.json
+
+# NHL27PC local runtime data. Game files must never be committed.
+game/
+games/
+runtime/
+release/game/
+PPSA*/
+CUSA*/
+**/sce_sys/
+**/sce_module/
+**/fakelib/
+**/eboot.bin
+_DownloadData/
+_SaveData/
+_TempData/
+*.pkg
+*.iso
+*.zar
+*.self
+*.sprx
+*.prx
+*.rap
+*.rif
+*.log
+crash-*.txt

@@ -1,0 +1,16 @@
+name: Repository safety
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  no-game-files:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Reject game and runtime data
+        shell: pwsh
+        run: .\tools\check_no_game_files.ps1
