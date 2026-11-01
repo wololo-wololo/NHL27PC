@@ -50,13 +50,39 @@ Other observations:
 - The first captured run reused an existing shader cache. A clean-cache capture is required before
   treating a shader hash or pipeline object as stable evidence.
 
+## 2026-11-01 patched fork validation
+
+- Fork revision: `723fb51`
+- Compatibility change: recognize the legacy LS shader resource descriptors from KytyPS5 PR #1903
+- CI: [Windows, Linux, and macOS builds and tests passed](https://github.com/wololo-wololo/NHL27PC/actions/runs/41332687902)
+- Host: NVIDIA GeForce RTX 5090, AMD Ryzen 7 9800X3D, Windows x64
+- Cache state: clean artifact directory; `--shader-cache` was not enabled
+- Result: a quick-play match reached live first-period gameplay and rendered the full rink, players,
+  crowd, and HUD. The clock reached 18:34 and the observed frame rate briefly reached about 14 FPS.
+  Controller input was not exercised during this automated capture.
+
+This is a substantial improvement over the baseline stop, but it is not yet a stable or polished
+playable release. First-run shader compilation repeatedly stalled presentation, sometimes at 0 FPS,
+and the renderer emitted recoverable `GPU Stopped Working` breadcrumb reports while continuing to
+advance. Observed locations included:
+
+- `ShaderProgram_SubSurfaceScatteringGenerateTilesCS` in `sssConvHorizontal`
+- `ShaderProgram_DeferredLightTile_LightingCS_ClearTile` in `mainOpaque`, using an indirect dispatch
+- `worldMainTransparent` draw calls
+- `ShaderProgram_StrandHairRasterizerFineCs` in `hairResolve`
+- `ShaderProgram_MeshWind` in `FieldInteraction/InteractionUpdate`
+
+No game data, shader cache, save data, logs, or captured frames are committed to this repository.
+
 ## Next diagnostic milestones
 
-1. Reproduce with a clean cache and record whether the first stopped pipeline is stable.
-2. Capture the offending compute shader and its indirect-dispatch arguments using Kyty's existing
-   shader/debug infrastructure.
-3. Determine whether the stop is an infinite guest shader loop, an invalid indirect dispatch, or
-   a resource-coherency problem.
-4. Implement the smallest generic correctness fix possible. If a temporary guard is necessary,
+1. Repeat with a persistent shader cache and measure a warm second boot separately from compilation.
+2. Capture the `ClearTile` indirect-dispatch arguments and the recoverable compute timeouts using
+   Kyty's shader/debug infrastructure.
+3. Determine whether each timeout is an infinite guest shader loop, invalid dispatch/draw data, or
+   a resource-coherency problem. Do not treat every breadcrumb report as the same defect.
+4. Verify controller input, pause/resume, audio, saves, and a complete period on the warm run.
+5. Add a virtual filename encoding layer for Frostbite keys that are invalid Windows filenames.
+6. Implement the smallest generic correctness fixes possible. If a temporary guard is necessary,
    gate it on `PPSA34063` and keep it disabled for all other titles.
-5. Add a focused regression test before enabling the fix by default.
+7. Add focused regression tests before enabling fixes by default.
