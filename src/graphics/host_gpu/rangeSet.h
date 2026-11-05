@@ -10,6 +10,62 @@
 
 namespace Libs::Graphics {
 
+// Disjoint ranges, each with the scheduler tick of its latest GPU write.
+class TickRangeMap final {
+public:
+	void Assign(uint64_t address, uint64_t size, uint64_t tick) {
+		if (size == 0) return;
+		const auto end = address + size;
+		auto       it  = m_ranges.lower_bound(address);
+		if (it != m_ranges.begin() && std::prev(it)->second.end > address) {
+			it = std::prev(it);
+		}
+		while (it != m_ranges.end() && it->first < end) {
+			const auto begin = it->first;
+			const auto value = it->second;
+			it               = m_ranges.erase(it);
+			if (begin < address) {
+				m_ranges.emplace(begin, Value {address, value.tick});
+			}
+			if (value.end > end) {
+				m_ranges.emplace(end, Value {value.end, value.tick});
+				break;
+			}
+		}
+		m_ranges.emplace(address, Value {end, tick});
+	}
+
+	// Latest write tick overlapping the range; 0 when none.
+	[[nodiscard]] uint64_t Max(uint64_t address, uint64_t size) const {
+		const auto end    = address + size;
+		uint64_t   result = 0;
+		auto       it     = m_ranges.lower_bound(address);
+		if (it != m_ranges.begin() && std::prev(it)->second.end > address) {
+			it = std::prev(it);
+		}
+		for (; it != m_ranges.end() && it->first < end; ++it) {
+			result = std::max(result, it->second.tick);
+		}
+		return result;
+	}
+
+	[[nodiscard]] size_t Size() const noexcept { return m_ranges.size(); }
+
+	// Drops entries written at or before `tick` (complete writes need no producer wait).
+	void Prune(uint64_t tick) {
+		for (auto it = m_ranges.begin(); it != m_ranges.end();) {
+			it = it->second.tick <= tick ? m_ranges.erase(it) : std::next(it);
+		}
+	}
+
+private:
+	struct Value {
+		uint64_t end;
+		uint64_t tick;
+	};
+	std::map<uint64_t, Value> m_ranges;
+};
+
 class RangeSet final {
 public:
 	void Add(uint64_t address, uint64_t size) {

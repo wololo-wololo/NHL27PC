@@ -52,6 +52,9 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Same family as `queue`; used only by the GPU thread (BufferCache side-queue readbacks).
+	vk::Queue                          readback_queue           = nullptr;
+	bool                               readback_queue_available = false;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

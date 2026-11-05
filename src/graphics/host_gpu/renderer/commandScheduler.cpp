@@ -1,15 +1,23 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuCheckpoints.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "common/threadSampler.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
+
+std::atomic<uint32_t> g_submit_probe {0};
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
@@ -101,6 +109,67 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_timestamps) {
+		m_graphics.device.destroyQueryPool(m_timestamps, nullptr);
+	}
+}
+
+constexpr uint32_t GPU_TIMING_SLOTS = 4096;
+
+void CommandScheduler::BeginGpuTiming() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_TIMING");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+	if (!m_timestamps) {
+		const vk::QueryPoolCreateInfo info {.queryType  = vk::QueryType::eTimestamp,
+		                                    .queryCount = GPU_TIMING_SLOTS * 2u};
+		RequireVulkanSuccess(m_graphics.device.createQueryPool(&info, nullptr, &m_timestamps),
+		                     "vkCreateQueryPool");
+	}
+	m_timestamp_query = (m_timestamp_slot++ % GPU_TIMING_SLOTS) * 2u;
+	m_command.m_buffer.resetQueryPool(m_timestamps, m_timestamp_query, 2);
+	m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, m_timestamps,
+	                                  m_timestamp_query);
+}
+
+void CommandScheduler::EndGpuTiming() {
+	if (m_timestamp_query == UINT32_MAX) {
+		return;
+	}
+	const auto query   = m_timestamp_query;
+	m_timestamp_query  = UINT32_MAX;
+	m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_timestamps,
+	                                  query + 1u);
+	// Submissions also happen without a bound context, which DeferOperation requires.
+	std::lock_guard lock(m_operation_mutex);
+	if (m_operation_state != OperationState::Open) {
+		return;
+	}
+	m_pending_operations.push({[this, query] {
+		std::array<uint64_t, 2> times {};
+		if (m_graphics.device.getQueryPoolResults(m_timestamps, query, 2, sizeof(times),
+		                                          times.data(), sizeof(uint64_t),
+		                                          vk::QueryResultFlagBits::e64) !=
+		    vk::Result::eSuccess) {
+			return;
+		}
+		const double period = m_graphics.physical_device_properties.limits.timestampPeriod;
+		using Common::DebugCounters::Counter;
+		Common::DebugCounters::Add(Counter::GpuTimedSubmits);
+		if (times[1] > times[0]) {
+			Common::DebugCounters::Add(
+			    Counter::GpuBusyNs, static_cast<uint64_t>(static_cast<double>(times[1] - times[0]) * period));
+		}
+		if (m_last_gpu_end != 0 && times[0] > m_last_gpu_end) {
+			Common::DebugCounters::Add(
+			    Counter::GpuGapNs, static_cast<uint64_t>(static_cast<double>(times[0] - m_last_gpu_end) * period));
+		}
+		m_last_gpu_end = std::max(m_last_gpu_end, times[1]);
+	}, CurrentTick()});
 }
 
 void CommandScheduler::Shutdown() {
@@ -335,6 +404,8 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	BeginGpuTiming();
+	GpuProfileBeginCommandBuffer(*this, m_command.m_buffer);
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
@@ -344,6 +415,27 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (g_submit_probe.load(std::memory_order_relaxed) != 0) {
+		static std::atomic<uint32_t> reported {0};
+		const auto                   n = reported.fetch_add(1, std::memory_order_relaxed);
+		if (n < 40) {
+			const bool gpu_thread = GuestGpu::IsGpuThread();
+			std::printf("submit inside dispatch window (probe %u): gpu_thread=%d debug_op=%u "
+			            "args=0x%x,0x%x,0x%x\n",
+			            g_submit_probe.load(std::memory_order_relaxed), gpu_thread ? 1 : 0,
+			            m_command.m_debug_op, m_command.m_debug_arg0, m_command.m_debug_arg1,
+			            m_command.m_debug_arg2);
+			static std::atomic<uint32_t> stacks_gpu {0};
+			static std::atomic<uint32_t> stacks_other {0};
+			if ((gpu_thread ? stacks_gpu : stacks_other).fetch_add(1) < (gpu_thread ? 1u : 6u)) {
+				Common::ThreadSampler::PrintCurrentStack("  submit stack");
+			}
+		}
+	}
+	m_command.RunRecordHook();
+	m_command.FlushComputeBarrier();
+	EndGpuTiming();
+	GpuProfileEndCommandBuffer(m_command.m_buffer, CurrentTick());
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -351,6 +443,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
+	Common::DebugCounters::ScopedTimer submit_timer(
+	    Common::DebugCounters::Counter::QueueSubmits,
+	    Common::DebugCounters::Counter::QueueSubmitNs);
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
@@ -374,9 +469,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
-
 	if (result != vk::Result::eSuccess) {
+		ReportGpuCheckpoints(graphics);
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,

@@ -91,6 +91,25 @@ public:
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
 	void               RunGarbageCollector();
+	// Inside a batch, CPU-data uploads share one barrier pair: they are recorded together at
+	// the end of the outermost batch, or before any other command is recorded (see
+	// CommandBuffer::Handle). KYTY_BATCH_UPLOADS=0 disables batching.
+	void BeginUploadBatch() noexcept { m_upload_batch_depth++; }
+	void EndUploadBatch();
+	void FlushUploads();
+
+	class UploadBatchScope {
+	public:
+		explicit UploadBatchScope(BufferCache& cache) noexcept: m_cache(cache) {
+			m_cache.BeginUploadBatch();
+		}
+		~UploadBatchScope() { m_cache.EndUploadBatch(); }
+		UploadBatchScope(const UploadBatchScope&)            = delete;
+		UploadBatchScope& operator=(const UploadBatchScope&) = delete;
+
+	private:
+		BufferCache& m_cache;
+	};
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -152,6 +171,23 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	struct PendingUpload {
+		vk::Buffer     source;
+		vk::Buffer     destination;
+		vk::BufferCopy copy;
+	};
+	std::vector<PendingUpload> m_pending_uploads;
+	// Tick of the latest GPU write per guest range (ObtainBuffer with is_written).
+	TickRangeMap               m_write_ticks;
+	// Downloads whose producers are already submitted run on GraphicContext::readback_queue,
+	// waiting only for the producer's tick instead of everything queued on the main queue.
+	[[nodiscard]] bool DownloadOnSideQueue(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                       uint64_t wait_tick);
+	vk::CommandPool            m_side_pool    = nullptr;
+	vk::CommandBuffer          m_side_command = nullptr;
+	vk::Fence                  m_side_fence   = nullptr;
+	std::unique_ptr<Buffer>    m_side_download;
+	uint32_t                   m_upload_batch_depth = 0;
 };
 
 } // namespace Libs::Graphics

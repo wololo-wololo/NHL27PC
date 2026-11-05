@@ -13,7 +13,11 @@
 #include <chrono>
 #include <fmt/format.h>
 #include <limits>
+#include <cstdio>
 #include <list>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -52,6 +56,8 @@ public:
 
 	int  GetTriggeredEvents(KernelEvent* ev, int num);
 	int  WaitForEvents(KernelEvent* ev, int num, uint32_t micros);
+	// The registered events, or a note when the queue's lock is held.
+	std::string DescribeEvents();
 	void Close();
 
 private:
@@ -172,8 +178,67 @@ bool KernelEqueuePrivate::GetNextTimerWaitMicros(uint64_t now_ns, uint32_t* wait
 	return true;
 }
 
+// Hang diagnostics: a wait blocked longer than STALL_REPORT_NS is printed once, with the
+// queue's registered events, by a monitor thread started on the first blocking wait.
+constexpr uint64_t STALL_REPORT_NS = 5'000'000'000ull;
+
+struct BlockedWait {
+	KernelEqueuePrivate* eq;
+	uint64_t             start_ns;
+	std::string          thread;
+	bool                 reported = false;
+};
+
+static std::mutex             g_blocked_mutex;
+static std::list<BlockedWait> g_blocked_waits;
+
+std::string KernelEqueuePrivate::DescribeEvents() {
+	if (!m_mutex.TryLock()) {
+		return "  (queue busy)\n";
+	}
+	std::string text;
+	for (const auto& event: m_events) {
+		text += fmt::format("  ident=0x{:x} filter={} flags=0x{:x} fflags=0x{:x} data=0x{:x} "
+		                    "triggered={} pending={}\n",
+		                    event.event.ident, event.event.filter, event.event.flags,
+		                    event.event.fflags, static_cast<uint64_t>(event.event.data),
+		                    event.triggered ? 1 : 0, event.pending_events.size());
+	}
+	m_mutex.Unlock();
+	return text;
+}
+
+static void StallMonitor() {
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		const auto       now = MonotonicTimeNs();
+		std::scoped_lock lock(g_blocked_mutex);
+		for (auto& wait: g_blocked_waits) {
+			if (wait.reported || wait.start_ns > now || now - wait.start_ns < STALL_REPORT_NS) {
+				continue;
+			}
+			wait.reported = true;
+			std::printf("EventQueue stall: thread %s blocked %.1f s on equeue '%s' (%p)\n%s",
+			            wait.thread.c_str(), static_cast<double>(now - wait.start_ns) / 1e9,
+			            wait.eq->GetName().c_str(), static_cast<void*>(wait.eq),
+			            wait.eq->DescribeEvents().c_str());
+			std::fflush(stdout);
+		}
+	}
+}
+
 int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros) {
 	Common::LockGuard lock(m_mutex);
+	std::optional<std::list<BlockedWait>::iterator> blocked;
+	struct Unblock {
+		std::optional<std::list<BlockedWait>::iterator>& entry;
+		~Unblock() {
+			if (entry) {
+				std::scoped_lock blocked_lock(g_blocked_mutex);
+				g_blocked_waits.erase(*entry);
+			}
+		}
+	} unblock {blocked};
 
 	EXIT_IF(num < 1);
 	if (m_closed) {
@@ -191,6 +256,14 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 			return ret;
 		}
 
+		if (!blocked && micros == 0) {
+			static std::once_flag monitor;
+			std::call_once(monitor, [] { std::thread(StallMonitor).detach(); });
+			std::scoped_lock blocked_lock(g_blocked_mutex);
+			blocked = g_blocked_waits.insert(
+			    g_blocked_waits.end(),
+			    {this, MonotonicTimeNs(), Common::Thread::GetThreadId()});
+		}
 		uint32_t   timer_wait = 0;
 		const bool has_timer  = GetNextTimerWaitMicros(MonotonicTimeNs(), &timer_wait);
 		if (micros == 0 && !has_timer) {

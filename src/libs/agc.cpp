@@ -1,6 +1,7 @@
 #include "libs/agc.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -311,6 +312,8 @@ struct CommandBuffer {
 		}
 		auto* ret_ptr = cursor_up;
 		cursor_up += size_dw;
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::AgcHelperPackets);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::AgcHelperDwords, size_dw);
 		return ret_ptr;
 	}
 };
@@ -4141,6 +4144,9 @@ static TessellationDriverState g_tessellation_driver_state {};
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::AgcDcbDwords, size_in_dwords);
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::AgcDcbSubmits,
+	                                          Common::DebugCounters::Counter::AgcDcbSubmitNs);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords});
 }
 
@@ -4200,6 +4206,9 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 
 	EXIT_IF(g_renderer == nullptr);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::AgcAcbDwords, size_in_dwords);
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::AgcAcbSubmits,
+	                                          Common::DebugCounters::Counter::AgcAcbSubmitNs);
 	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
 }
 

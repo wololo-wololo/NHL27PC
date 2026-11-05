@@ -15,6 +15,9 @@
 
 namespace Libs::Graphics {
 
+// Diagnostics: nonzero while a dispatch records into a captured command-buffer handle.
+extern std::atomic<uint32_t> g_submit_probe;
+
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);
@@ -44,6 +47,7 @@ public:
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	[[nodiscard]] bool Recording() const noexcept { return !m_command.IsInvalid(); }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
@@ -86,6 +90,15 @@ private:
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+
+	// GPU timestamps bracketing each command buffer, read when its tick completes.
+	void BeginGpuTiming();
+	void EndGpuTiming();
+
+	vk::QueryPool                m_timestamps       = nullptr;
+	uint32_t                     m_timestamp_slot   = 0;
+	uint32_t                     m_timestamp_query  = UINT32_MAX;
+	uint64_t                     m_last_gpu_end     = 0;
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;

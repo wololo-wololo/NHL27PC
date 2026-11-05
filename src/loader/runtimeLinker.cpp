@@ -669,10 +669,29 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// An SRT walker load (mov eax, [r10]) reads its own four bytes from the backing store,
+		// downloading them only when they are GPU-written. Unprotecting the page instead would
+		// read back every GPU-written byte near it and wait for the whole GPU.
+		if (access == GpuAccess::Read) {
+			if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+			        info->exception_address)) {
+				uint32_t value = 0;
+				if (Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value,
+				                                                  sizeof(value))) {
+					Common::DebugCounters::Add(Common::DebugCounters::Counter::WalkerLoadsEmulated);
+					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length,
+					                                             value);
+					return true;
+				}
+			}
+		}
+		Common::DebugCounters::ScopedTimer fault_timer(
+		    Common::DebugCounters::Counter::GpuFaults,
+		    Common::DebugCounters::Counter::GpuFaultNs);
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
+		fault_timer.Cancel();
 		if (const auto length =
 		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
 			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);

@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1814,6 +1815,19 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	return 3;
 }
 
+// Copies an indirect register table through the backing store. Its pages may also hold
+// GPU-written bytes; reading them directly would fault and read back the whole range, although
+// the table itself is only downloaded when its own bytes are GPU-written.
+static uint32_t* ReadRegisterTable(uint32_t* table, uint32_t count) {
+	thread_local std::vector<uint32_t> copy;
+	copy.resize(size_t {count} * 2u);
+	if (!LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(table), copy.data(),
+	                                             copy.size() * sizeof(uint32_t))) {
+		return table;
+	}
+	return copy.data();
+}
+
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1831,6 +1845,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	indirect_buffer = ReadRegisterTable(indirect_buffer, indirect_num_dw);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -1901,6 +1916,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	indirect_buffer = ReadRegisterTable(indirect_buffer, indirect_num_dw);
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
@@ -1964,6 +1980,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	indirect_buffer = ReadRegisterTable(indirect_buffer, indirect_num_dw);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2013,6 +2030,8 @@ KYTY_CP_OP_PARSER(CpOpNop) {
 	auto cp_op = g_cp_op_custom_func[r];
 
 	if (cp_op != nullptr) {
+		Common::DebugCounters::OpcodeTimer timer(256u + r);
+		Common::DebugCounters::SetCurrentOpcode(256u + r);
 		return cp_op(cp, cmd_id, buffer, dw, num_dw);
 	}
 

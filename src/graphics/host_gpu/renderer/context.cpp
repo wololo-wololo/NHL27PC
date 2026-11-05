@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -7,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -25,12 +27,29 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	RunRecordHook();
+	m_handle_calls++;
+	if (!m_dispatch_chain) {
+		FlushComputeBarrier();
+		m_other_work = true;
+	}
 	return m_buffer;
 }
 
+void CommandBuffer::FlushComputeBarrier() const {
+	if (!m_compute_barrier_pending) {
+		return;
+	}
+	EXIT_IF(m_rendering);
+	m_compute_barrier_pending = false;
+	ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::CsBarriersFlushed);
+}
+
 void CommandBuffer::Begin() {
-	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	EXIT_IF(m_rendering || IsInvalid() || m_compute_barrier_pending);
+	m_other_work = true;
+	auto buffer  = m_buffer;
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -67,6 +86,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::RenderPassBegins);
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {

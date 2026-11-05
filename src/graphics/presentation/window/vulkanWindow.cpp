@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/renderer/gpuCheckpoints.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -444,11 +445,25 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	// A second queue of the same family serves buffer readbacks whose GPU producer already
+	// finished, so they need not wait behind the main queue's backlog.
+	const float queue_priorities[2] = {1.0f, 1.0f};
+	uint32_t    family_count        = 0;
+	physical_device.getQueueFamilyProperties(&family_count, nullptr);
+	std::vector<vk::QueueFamilyProperties> families(family_count);
+	physical_device.getQueueFamilyProperties(&family_count, families.data());
+	// KYTY_READBACK_QUEUE=0 creates only the main queue (no side-queue readbacks).
+	const char*    readback_env = std::getenv("KYTY_READBACK_QUEUE");
+	const bool     readback_off = readback_env != nullptr && readback_env[0] == '0';
+	const uint32_t queue_count  = !readback_off && queue_family < families.size() &&
+	                                     families[queue_family].queueCount >= 2
+	                                 ? 2u
+	                                 : 1u;
+	graphics.readback_queue_available = queue_count == 2u;
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount       = queue_count;
+	queue_create_info.pQueuePriorities = queue_priorities;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -751,6 +766,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates its
 	// PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when a
 	// depth- or stencil-writing fragment shader needs an epilog.
+	// Device-loss diagnostics: the driver can report GPU memory faults after the loss.
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	device_fault.deviceFault = VK_TRUE;
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		device_fault.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext  = &device_fault;
+	}
 	vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state {};
 	extended_dynamic_state.extendedDynamicState = VK_TRUE;
 	if (HasExtension(device_extensions, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) {
@@ -1084,6 +1106,7 @@ void WindowContext::CreateVulkan() {
 #endif
 
 	std::string rejected_devices;
+	bool        gpu_checkpoints = false;
 	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions, surface_capabilities,
 	                         graphic_ctx.physical_device, graphic_ctx.queue_family,
 	                         rejected_devices);
@@ -1147,6 +1170,16 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
+		if (GpuCheckpointsRequested() &&
+		    HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+			gpu_checkpoints = true;
+		}
+		if (GpuCheckpointsRequested() &&
+		    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+			SetDeviceFaultReporting(true);
+		}
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -1154,8 +1187,15 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	if (gpu_checkpoints) {
+		InitGpuCheckpoints(graphic_ctx);
+		std::printf("GPU checkpoints: %s\n", GpuCheckpointsEnabled() ? "buffer markers" : "unavailable");
+	}
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.readback_queue_available) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1199,6 +1239,7 @@ WindowContext::~WindowContext() {
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;
 		graphic_ctx.queue  = nullptr;
+		graphic_ctx.readback_queue = nullptr;
 	}
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);

@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -125,6 +126,7 @@ private:
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+	void                GuestSync();
 
 	RenderContext& m_renderer;
 	HW::Context    m_ctx;

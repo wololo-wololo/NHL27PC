@@ -6,11 +6,13 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "common/threadSampler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -25,11 +27,15 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <unordered_set>
+#include <string>
+#include <cstring>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -224,6 +230,9 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	Common::DebugCounters::ScopedTimer timer(
+	    Common::DebugCounters::Counter::BufferFlushCalls,
+	    Common::DebugCounters::Counter::BufferFlushNs);
 	GetScheduler().Flush();
 	// The occlusion counters reach a guest that polls them without waiting for a later fence.
 	m_renderer.GetOcclusionQueries().Publish();
@@ -264,7 +273,13 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	// Labels often share pages with GPU-written data; read the label's own bytes without a fault.
+	T value {};
+	if (!LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(addr), &value,
+	                                             sizeof(value))) {
+		value = *addr;
+	}
+	if (!TestWaitRegMemValue(value, ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -401,6 +416,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Common::ThreadSampler::RegisterCurrentThreadFromEnvironment("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
@@ -522,13 +538,22 @@ bool GuestGpu::Process(Submission& submission) {
 				GraphicsDbgDumpDcb("cc", num_dw, buffer);
 			}
 			[[fallthrough]];
-		case SubmissionType::Graphics:
-			complete =
-			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
+		case SubmissionType::Graphics: {
+			Common::DebugCounters::ScopedTimer process_timer(
+			    Common::DebugCounters::Counter::Pm4ProcessCalls,
+			    Common::DebugCounters::Counter::Pm4ProcessNs);
+			{
+				Common::DebugCounters::ScopedTimer decode_timer(
+				    Common::DebugCounters::Counter::Pm4DecodeCalls,
+				    Common::DebugCounters::Counter::Pm4DecodeNs);
+				complete = cp.Process(submission.execution, submission.commands) ==
+				           Pm4ProcessResult::Complete;
+			}
 			if (submission.execution.MadeProgress()) {
 				cp.BufferFlush();
 			}
 			break;
+		}
 		case SubmissionType::FlipPreparation:
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
@@ -588,6 +613,33 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// Packets through which the guest orders GPU work or exchanges data with memory. Dispatches
+// before them complete first when compute barriers are relaxed.
+static bool IsGuestSyncOpcode(uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_SET_PREDICATION:
+		case Pm4::IT_COND_EXEC:
+		case Pm4::IT_WRITE_DATA:
+		case Pm4::IT_MEM_SEMAPHORE:
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64:
+		case Pm4::IT_COPY_DATA:
+		case Pm4::IT_EVENT_WRITE:
+		case Pm4::IT_RELEASE_MEM:
+		case Pm4::IT_DMA_DATA:
+		case Pm4::IT_ACQUIRE_MEM: return true;
+		default: return false;
+	}
+}
+
+void CommandProcessor::GuestSync() {
+	auto& scheduler = GetScheduler();
+	if (scheduler.Recording() && scheduler.Current().ComputeBarrierPending()) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::CsGuestSyncFlushes);
+		scheduler.Current().FlushComputeBarrier();
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
@@ -637,6 +689,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		GpuTracePacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw));
+
+		if (IsGuestSyncOpcode(opcode)) {
+			GuestSync();
+		}
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -654,8 +711,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		const bool counters_enabled = Common::DebugCounters::Enabled();
+		Common::DebugCounters::SetCurrentOpcode(opcode);
+		const auto packet_start =
+		    counters_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		Common::DebugCounters::SetCurrentOpcode(Common::DebugCounters::Detail::OPCODE_SLOTS);
+		if (counters_enabled) {
+			Common::DebugCounters::AddOpcode(
+			    opcode, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                      std::chrono::steady_clock::now() - packet_start)
+			                                      .count()));
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -1022,6 +1090,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
 	if (interrupt) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::InterruptsQueued);
 		GetScheduler().DeferPriorityOperation(
 		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 			    renderer.TriggerInterrupt(event_id, interrupt_context_id);

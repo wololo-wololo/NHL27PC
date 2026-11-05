@@ -114,6 +114,48 @@ public:
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// The current Vulkan buffer without flushing deferred barriers. A submit while a command is
+	// being prepared retires the buffer, so a handle read earlier stops being the current one.
+	[[nodiscard]] vk::CommandBuffer RawHandle() const noexcept { return m_buffer; }
+	[[nodiscard]] bool              IsRendering() const noexcept { return m_rendering; }
+	// Incremented by every Handle() call: equal values mean nothing was recorded in between.
+	[[nodiscard]] uint64_t          HandleCalls() const noexcept { return m_handle_calls; }
+	// Deferred recordings (batched uploads) that must precede anything recorded next: the next
+	// Handle() call, or submission, runs the hook once before returning.
+	void SetRecordHook(void (*hook)(void*), void* context) const noexcept {
+		m_record_hook    = hook;
+		m_record_context = context;
+	}
+	void RunRecordHook() const {
+		if (m_record_hook != nullptr) {
+			auto* hook    = m_record_hook;
+			m_record_hook = nullptr;
+			hook(m_record_context);
+		}
+	}
+
+	// Consecutive graphics-queue dispatches may overlap on the guest GPU unless the command
+	// stream synchronizes them. With relaxed compute barriers, the barrier after such a
+	// dispatch stays pending until the guest synchronizes or anything else records commands;
+	// Handle() records it first.
+	class DispatchChainScope {
+	public:
+		explicit DispatchChainScope(const CommandBuffer& buffer) noexcept: m_buffer(buffer) {
+			m_buffer.m_dispatch_chain = true;
+		}
+		~DispatchChainScope() { m_buffer.m_dispatch_chain = false; }
+		DispatchChainScope(const DispatchChainScope&)            = delete;
+		DispatchChainScope& operator=(const DispatchChainScope&) = delete;
+
+	private:
+		const CommandBuffer& m_buffer;
+	};
+	[[nodiscard]] bool ComputeBarrierPending() const noexcept { return m_compute_barrier_pending; }
+	// True when only chained dispatches were recorded since the last hazard barrier.
+	[[nodiscard]] bool OnlyDispatchesSinceHazard() const noexcept { return !m_other_work; }
+	void               DeferComputeBarrier() const noexcept { m_compute_barrier_pending = true; }
+	void               NoteHazardBarrier() const noexcept { m_other_work = false; }
+	void               FlushComputeBarrier() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -143,6 +185,12 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable bool        m_compute_barrier_pending = false;
+	mutable bool        m_dispatch_chain          = false;
+	mutable bool        m_other_work              = true;
+	mutable uint64_t    m_handle_calls            = 0;
+	mutable void (*m_record_hook)(void*)          = nullptr;
+	mutable void*       m_record_context          = nullptr;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
