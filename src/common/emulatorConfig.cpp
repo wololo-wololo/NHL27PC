@@ -17,6 +17,7 @@ void Initialize() {
 }
 
 void Shutdown() {
+	Common::DebugCounters::StopCsvLogger();
 	Common::DebugCounters::SetEnabled(false);
 	g_config.reset();
 }
@@ -30,6 +31,7 @@ void Load(const ConfigOptions& cfg) {
 
 	*g_config = cfg;
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
+	Common::DebugCounters::StartCsvLoggerFromEnvironment();
 }
 
 uint32_t GetScreenWidth() {

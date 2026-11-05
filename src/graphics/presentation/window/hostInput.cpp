@@ -1,4 +1,5 @@
 #include "graphics/presentation/window/hostInput.h"
+#include "graphics/presentation/window/inputPipe.h"
 
 #include <SDL3/SDL.h>
 
@@ -742,6 +743,7 @@ void HostInputDisconnectGamepad(int id) {
 
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
+	InputPipeStart();
 	g_mouse_window = window;
 	if (Config::HideCursorEnabled()) {
 		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
@@ -749,6 +751,7 @@ void HostInputInit(SDL_Window* window) {
 }
 
 void HostInputShutdown() {
+	InputPipeStop();
 	g_pad_trigger_pressed.clear();
 	HostInputSetTouchPadMode(false);
 	int gamepad_touch_id = -1;

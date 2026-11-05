@@ -1,3 +1,4 @@
+#include "common/debugCounters.h"
 #include "common/common.h"
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -315,6 +316,8 @@ bool FreeRange(uint64_t address, uint64_t size) {
 }
 
 bool Protect(uint64_t address, uint64_t size, Mode mode) {
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ProtectCalls,
+	                                         Common::DebugCounters::Counter::ProtectNs);
 	DWORD old_protect = 0;
 	if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                   GetProtectionFlag(mode), &old_protect) == 0) {

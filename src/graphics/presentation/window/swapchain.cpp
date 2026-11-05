@@ -14,6 +14,7 @@
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/screenshot.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -21,8 +22,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -966,6 +973,235 @@ Swapchain::Status Swapchain::Present() {
 	return Status::Success;
 }
 
+namespace {
+
+// One outstanding screenshot request (see screenshot.h). The flip thread records a copy of the
+// prepared frame into a host-visible buffer; the requesting thread waits for that GPU tick and
+// converts the pixels.
+struct ScreenshotState {
+	std::mutex              mutex;
+	std::condition_variable cv;
+	std::atomic_bool        requested {false};
+	bool                    recorded  = false;
+	std::string             error;
+	GraphicContext*         graphics  = nullptr;
+	CommandScheduler*       scheduler = nullptr;
+	vk::Buffer              buffer    = nullptr;
+	vk::DeviceMemory        memory    = nullptr;
+	void*                   mapped    = nullptr;
+	uint64_t                tick      = 0;
+	uint32_t                width     = 0;
+	uint32_t                height    = 0;
+	vk::Format              format    = vk::Format::eUndefined;
+};
+
+ScreenshotState g_shot;
+
+void FreeScreenshotBuffer() {
+	if (g_shot.graphics == nullptr) {
+		return;
+	}
+	auto& device = g_shot.graphics->device;
+	if (g_shot.mapped != nullptr) {
+		device.unmapMemory(g_shot.memory);
+	}
+	if (g_shot.buffer != nullptr) {
+		device.destroyBuffer(g_shot.buffer, nullptr);
+	}
+	if (g_shot.memory != nullptr) {
+		device.freeMemory(g_shot.memory, nullptr);
+	}
+	g_shot.buffer = nullptr;
+	g_shot.memory = nullptr;
+	g_shot.mapped = nullptr;
+}
+
+// Called on the flip thread right after the prepared frame was filled.
+void RecordScreenshot(CommandBuffer& command_buffer, Presenter::Frame& frame,
+                      GraphicContext& graphics) {
+	if (!g_shot.requested.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::scoped_lock lock(g_shot.mutex);
+	if (!g_shot.requested.load() || g_shot.recorded) {
+		return;
+	}
+	const auto format = frame.image.format;
+	if (format != vk::Format::eR8G8B8A8Unorm && format != vk::Format::eB8G8R8A8Unorm &&
+	    format != vk::Format::eA2B10G10R10UnormPack32 &&
+	    format != vk::Format::eA2R10G10B10UnormPack32) {
+		g_shot.error    = "unsupported frame format " + vk::to_string(format);
+		g_shot.recorded = true;
+		g_shot.cv.notify_all();
+		return;
+	}
+	const uint32_t width  = frame.image.extent.width;
+	const uint32_t height = frame.image.extent.height;
+
+	g_shot.graphics = &graphics;
+	const vk::BufferCreateInfo buffer_info {.size  = uint64_t {width} * height * 4,
+	                                        .usage = vk::BufferUsageFlagBits::eTransferDst};
+	auto& device = graphics.device;
+	if (device.createBuffer(&buffer_info, nullptr, &g_shot.buffer) != vk::Result::eSuccess) {
+		g_shot.buffer = nullptr;
+		g_shot.error  = "createBuffer failed";
+	} else {
+		vk::MemoryRequirements requirements {};
+		device.getBufferMemoryRequirements(g_shot.buffer, &requirements);
+		const auto&    memory = graphics.physical_device_memory_properties;
+		constexpr auto wanted =
+		    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+		uint32_t type = UINT32_MAX;
+		// Prefer cached system memory: the CPU reads every byte.
+		for (int pass = 0; pass < 2 && type == UINT32_MAX; pass++) {
+			for (uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; i++) {
+				const auto flags  = memory.memoryTypes[i].propertyFlags;
+				const bool cached = static_cast<bool>(flags & vk::MemoryPropertyFlagBits::eHostCached);
+				if ((requirements.memoryTypeBits & (1u << i)) != 0 && (flags & wanted) == wanted &&
+				    (pass == 1 || cached)) {
+					type = i;
+				}
+			}
+		}
+		const vk::MemoryAllocateInfo allocate {.allocationSize  = requirements.size,
+		                                       .memoryTypeIndex = type};
+		if (type == UINT32_MAX ||
+		    device.allocateMemory(&allocate, nullptr, &g_shot.memory) != vk::Result::eSuccess ||
+		    device.bindBufferMemory(g_shot.buffer, g_shot.memory, 0) != vk::Result::eSuccess ||
+		    device.mapMemory(g_shot.memory, 0, VK_WHOLE_SIZE, {}, &g_shot.mapped) !=
+		        vk::Result::eSuccess) {
+			g_shot.error = "host-visible allocation failed";
+		}
+	}
+	if (!g_shot.error.empty()) {
+		FreeScreenshotBuffer();
+		g_shot.recorded = true;
+		g_shot.cv.notify_all();
+		return;
+	}
+
+	auto command = command_buffer.Handle();
+	frame.Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+	vk::BufferImageCopy region {};
+	region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.imageExtent      = {width, height, 1};
+	command.copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal,
+	                          g_shot.buffer, 1, &region);
+	vk::MemoryBarrier2 to_host {};
+	to_host.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	to_host.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	to_host.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	to_host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &to_host;
+	command.pipelineBarrier2(dependency);
+
+	g_shot.scheduler = &command_buffer.GetContext().GetCommandScheduler();
+	g_shot.tick      = g_shot.scheduler->CurrentTick();
+	g_shot.width     = width;
+	g_shot.height    = height;
+	g_shot.format    = format;
+	g_shot.recorded  = true;
+	g_shot.cv.notify_all();
+}
+
+bool WriteScreenshotBmp(const std::string& path) {
+	const uint32_t width  = g_shot.width;
+	const uint32_t height = g_shot.height;
+	const uint32_t stride = (width * 3 + 3) & ~3u;
+	std::vector<uint8_t> file(54 + uint64_t {stride} * height);
+	auto put32 = [&](size_t at, uint32_t v) {
+		for (int i = 0; i < 4; i++) {
+			file[at + i] = static_cast<uint8_t>(v >> (8 * i));
+		}
+	};
+	file[0] = 'B';
+	file[1] = 'M';
+	put32(2, static_cast<uint32_t>(file.size()));
+	put32(10, 54);
+	put32(14, 40);
+	put32(18, width);
+	put32(22, height);
+	file[26] = 1;
+	file[28] = 24;
+	put32(34, stride * height);
+	const auto* src = static_cast<const uint32_t*>(g_shot.mapped);
+	for (uint32_t y = 0; y < height; y++) {
+		uint8_t* row = file.data() + 54 + uint64_t {height - 1 - y} * stride;
+		for (uint32_t x = 0; x < width; x++) {
+			const uint32_t p = src[uint64_t {y} * width + x];
+			uint32_t       r = 0, g = 0, b = 0;
+			switch (g_shot.format) {
+				case vk::Format::eR8G8B8A8Unorm: r = p & 255; g = (p >> 8) & 255; b = (p >> 16) & 255; break;
+				case vk::Format::eB8G8R8A8Unorm: b = p & 255; g = (p >> 8) & 255; r = (p >> 16) & 255; break;
+				case vk::Format::eA2B10G10R10UnormPack32:
+					r = (p & 1023) >> 2; g = ((p >> 10) & 1023) >> 2; b = ((p >> 20) & 1023) >> 2;
+					break;
+				default:
+					b = (p & 1023) >> 2; g = ((p >> 10) & 1023) >> 2; r = ((p >> 20) & 1023) >> 2;
+					break;
+			}
+			row[x * 3 + 0] = static_cast<uint8_t>(b);
+			row[x * 3 + 1] = static_cast<uint8_t>(g);
+			row[x * 3 + 2] = static_cast<uint8_t>(r);
+		}
+	}
+	std::FILE* out = std::fopen(path.c_str(), "wb");
+	if (out == nullptr) {
+		return false;
+	}
+	const bool ok = std::fwrite(file.data(), 1, file.size(), out) == file.size();
+	return std::fclose(out) == 0 && ok;
+}
+
+} // namespace
+
+bool CaptureScreenshot(const std::string& path, int timeout_ms, std::string* message) {
+	using Clock         = std::chrono::steady_clock;
+	const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
+	std::unique_lock lock(g_shot.mutex);
+	if (g_shot.requested.load()) {
+		*message = "busy";
+		return false;
+	}
+	g_shot.recorded = false;
+	g_shot.error.clear();
+	g_shot.requested.store(true, std::memory_order_release);
+	if (!g_shot.cv.wait_until(lock, deadline, [] { return g_shot.recorded; })) {
+		g_shot.requested.store(false);
+		*message = "no guest flip within timeout";
+		return false;
+	}
+	if (!g_shot.error.empty()) {
+		*message = g_shot.error;
+		g_shot.requested.store(false);
+		return false;
+	}
+	// The command buffer is submitted by the flip thread; wait for its tick off that thread.
+	// Past the deadline keep waiting (bounded) so the buffer is never freed while in use.
+	const auto hard_deadline = deadline + std::chrono::seconds(10);
+	while (!g_shot.scheduler->IsFree(g_shot.tick)) {
+		if (Clock::now() > hard_deadline) {
+			*message = "GPU did not finish the copy (buffer leaked)";
+			g_shot.buffer = nullptr;
+			g_shot.memory = nullptr;
+			g_shot.mapped = nullptr;
+			g_shot.requested.store(false);
+			return false;
+		}
+		lock.unlock();
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		lock.lock();
+	}
+	const bool ok = WriteScreenshotBmp(path);
+	*message      = ok ? std::to_string(g_shot.width) + "x" + std::to_string(g_shot.height)
+	                   : "cannot write " + path;
+	FreeScreenshotBuffer();
+	g_shot.requested.store(false);
+	return ok;
+}
+
 Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(window)) {}
 
 Presenter::~Presenter() = default;
@@ -991,6 +1227,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	RecordScreenshot(buffer, *frame, m_impl->window.graphic_ctx);
 	if (headset) {
 		// The frame holds the raw display-encoded pixels the headset needs.
 		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,

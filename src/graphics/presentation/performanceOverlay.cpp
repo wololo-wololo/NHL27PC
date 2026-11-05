@@ -306,6 +306,10 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
 	Row("Draw calls", Fmt("%.0f/frame  %.0f/s", draws / std::max(shown.fps, 1.0), draws));
+	const auto guest_submits =
+	    Rate(shown, Counter::AgcDcbSubmits) + Rate(shown, Counter::AgcAcbSubmits);
+	Row("Guest AGC submits",
+	    Fmt("%.0f/frame  %.0f/s", guest_submits / std::max(shown.fps, 1.0), guest_submits));
 	// Includes present pacing waits, so a high value alone is not a stall.
 	Row("CPU waiting on GPU",
 	    Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,
@@ -487,9 +491,106 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		Row("Indirect draws", Fmt("%.0f/s", Rate(shown, Counter::IndirectDraws)));
 		Row("Dispatches", Fmt("%.0f/frame  %.0f/s", Rate(shown, Counter::Dispatches) / fps,
 		                      Rate(shown, Counter::Dispatches)));
-		Row("Queue submits", Fmt("%.0f/s", Rate(shown, Counter::QueueSubmits)));
+		const auto dcb_submits = Rate(shown, Counter::AgcDcbSubmits);
+		const auto acb_submits = Rate(shown, Counter::AgcAcbSubmits);
+		const auto submitted_dwords =
+		    Rate(shown, Counter::AgcDcbDwords) + Rate(shown, Counter::AgcAcbDwords);
+		const auto helper_dwords = Rate(shown, Counter::AgcHelperDwords);
+		Row("Guest AGC split",
+		    Fmt("%.0f graphics + %.0f compute / frame", dcb_submits / fps, acb_submits / fps));
+		Row("AGC command stream",
+		    Fmt("%.1f kDW/frame  (%.0f%% helper-produced)", submitted_dwords / fps / 1000.0,
+		        submitted_dwords > 0.0 ? helper_dwords / submitted_dwords * 100.0 : 0.0));
+		Row("AGC helper packets",
+		    Fmt("%.0f/frame", Rate(shown, Counter::AgcHelperPackets) / fps));
+		Row("AGC submit overhead",
+		    Fmt("%.0f ms/s", (Rate(shown, Counter::AgcDcbSubmitNs) +
+		                       Rate(shown, Counter::AgcAcbSubmitNs)) /
+		                          1e6));
+		Row("PM4 processing",
+		    Fmt("%.0f ms/s  (%.0f slices/s)", Rate(shown, Counter::Pm4ProcessNs) / 1e6,
+		        Rate(shown, Counter::Pm4ProcessCalls)));
+		Row("  PM4 decode + execute",
+		    Fmt("%.0f ms/s  (%.0f slices/s)", Rate(shown, Counter::Pm4DecodeNs) / 1e6,
+		        Rate(shown, Counter::Pm4DecodeCalls)));
+		const auto draw_calls = Rate(shown, Counter::DrawProcessCalls);
+		Row("  Draw processing",
+		    Fmt("%.0f ms/s  (%.1f us/call)", Rate(shown, Counter::DrawProcessNs) / 1e6,
+		        draw_calls > 0.0 ? Rate(shown, Counter::DrawProcessNs) / 1e3 / draw_calls : 0.0));
+		const auto draw_state_calls = Rate(shown, Counter::DrawStatePrepCalls);
+		Row("    State + targets",
+		    Fmt("%.0f ms/s  (%.1f us/call)", Rate(shown, Counter::DrawStatePrepNs) / 1e6,
+		        draw_state_calls > 0.0
+		            ? Rate(shown, Counter::DrawStatePrepNs) / 1e3 / draw_state_calls
+		            : 0.0));
+		const auto draw_execute_calls = Rate(shown, Counter::DrawExecuteCalls);
+		Row("    Bind + emit",
+		    Fmt("%.0f ms/s  (%.1f us/call)", Rate(shown, Counter::DrawExecuteNs) / 1e6,
+		        draw_execute_calls > 0.0
+		            ? Rate(shown, Counter::DrawExecuteNs) / 1e3 / draw_execute_calls
+		            : 0.0));
+		const auto image_reuses   = Rate(shown, Counter::BindingImageReuses);
+		const auto image_resolves = Rate(shown, Counter::BindingImageResolves);
+		const auto sampler_reuses = Rate(shown, Counter::BindingSamplerReuses);
+		const auto sampler_resolves = Rate(shown, Counter::BindingSamplerResolves);
+		Row("      Binding reuse",
+		    Fmt("images %.0f%%, samplers %.0f%%",
+		        image_reuses + image_resolves > 0.0
+		            ? image_reuses * 100.0 / (image_reuses + image_resolves)
+		            : 0.0,
+		        sampler_reuses + sampler_resolves > 0.0
+		            ? sampler_reuses * 100.0 / (sampler_reuses + sampler_resolves)
+		            : 0.0));
+		const auto dispatch_calls = Rate(shown, Counter::DispatchProcessCalls);
+		Row("  Dispatch processing",
+		    Fmt("%.0f ms/s  (%.1f us/call)", Rate(shown, Counter::DispatchProcessNs) / 1e6,
+		        dispatch_calls > 0.0
+		            ? Rate(shown, Counter::DispatchProcessNs) / 1e3 / dispatch_calls
+		            : 0.0));
+		const auto buffer_flushes = Rate(shown, Counter::BufferFlushCalls);
+		Row("  Command-buffer flush",
+		    Fmt("%.0f ms/s  (%.1f us/flush)", Rate(shown, Counter::BufferFlushNs) / 1e6,
+		        buffer_flushes > 0.0
+		            ? Rate(shown, Counter::BufferFlushNs) / 1e3 / buffer_flushes
+		            : 0.0));
+		const auto queue_submits = Rate(shown, Counter::QueueSubmits);
+		Row("Vulkan queue submits",
+		    Fmt("%.0f/s  (%.0f ms/s CPU, %.1f us avg)", queue_submits,
+		        Rate(shown, Counter::QueueSubmitNs) / 1e6,
+		        queue_submits > 0.0 ? Rate(shown, Counter::QueueSubmitNs) / 1e3 / queue_submits
+		                            : 0.0));
 		const auto faults = Rate(shown, Counter::GpuFaults);
-		Row("Write-tracking faults", Fmt("%.0f/s", faults), LevelColor(faults, 20000, 100000));
+		Row("Write-tracking faults",
+		    Fmt("%.0f/s  (%.0f ms/s, %.1f us avg)", faults,
+		        Rate(shown, Counter::GpuFaultNs) / 1e6,
+		        faults > 0.0 ? Rate(shown, Counter::GpuFaultNs) / 1e3 / faults : 0.0),
+		    LevelColor(faults, 20000, 100000));
+		Row("  Fault access",
+		    Fmt("reads %.0f/s, writes %.0f/s", Rate(shown, Counter::GpuFaultReads),
+		        Rate(shown, Counter::GpuFaultWrites)));
+		Row("  Fault handler split",
+		    Fmt("map %.0f + buf %.0f + tex %.0f + heap %.0f ms/s",
+		        Rate(shown, Counter::GpuFaultMappedNs) / 1e6,
+		        Rate(shown, Counter::GpuFaultBufferNs) / 1e6,
+		        Rate(shown, Counter::GpuFaultTextureNs) / 1e6,
+		        Rate(shown, Counter::GpuFaultImageHeapNs) / 1e6));
+		Row("    Buffer split",
+		    Fmt("tracker %.0f + BDA queue %.0f ms/s",
+		        Rate(shown, Counter::GpuFaultBufferTrackerNs) / 1e6,
+		        Rate(shown, Counter::GpuFaultBdaSyncNs) / 1e6));
+		const auto buffer_reads = Rate(shown, Counter::BufferReadCalls);
+		Row("    Readback calls",
+		    Fmt("%.0f/s, queued %.0f/s, dirty %.0f/s, downloads %.0f/s", buffer_reads,
+		        Rate(shown, Counter::BufferReadQueuedCalls),
+		        Rate(shown, Counter::BufferReadDirtyCalls),
+		        Rate(shown, Counter::BufferReadDownloadCalls)));
+		const auto read_sync_ns = Rate(shown, Counter::BufferReadSyncNs);
+		const auto read_body_ns = Rate(shown, Counter::BufferReadBodyNs);
+		Row("    Readback timing",
+		    Fmt("wait %.0f + body %.0f ms/s, download %.0f ms/s, %.1f us/call",
+		        std::max(0.0, read_sync_ns - read_body_ns) / 1e6, read_body_ns / 1e6,
+		        Rate(shown, Counter::BufferReadDownloadNs) / 1e6,
+		        buffer_reads > 0.0 ? read_sync_ns / 1e3 / buffer_reads : 0.0));
 		CompilationRows(shown);
 		ImGui::EndTable();
 	}
