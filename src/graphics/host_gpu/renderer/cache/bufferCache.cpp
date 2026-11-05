@@ -508,7 +508,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			bool use_side = false;
 			uint64_t wait_tick = 0;
 			if (side_readbacks && m_graphics.readback_queue != nullptr &&
-			    Common::DebugCounters::AbVariant() && !m_scheduler.HasPendingPriorityOperations()) {
+			    !m_scheduler.HasPendingPriorityOperations()) {
 				// Every GPU write to these bytes must already be submitted: work recorded since
 				// the last submit carries the current tick. Pruned entries were complete.
 				const auto producer = m_write_ticks.Max(start, end - start);

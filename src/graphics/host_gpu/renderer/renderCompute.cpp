@@ -565,7 +565,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// chains of 1-group solver dispatches (one per object) without guest sync in between, which
 	// the guest GPU overlaps; serialized, each occupies one SM for ~0.7 ms.
 	const bool single_group =
-	    ChainSingleGroupDispatches() && Common::DebugCounters::AbVariant() &&
+	    ChainSingleGroupDispatches() &&
 	    uint64_t {thread_group_x} * thread_group_y * thread_group_z == 1u &&
 	    ChainShaderAllowed(program.shader_hash);
 	const bool chainable = (RelaxedComputeBarriers() || single_group) && !async_compute &&

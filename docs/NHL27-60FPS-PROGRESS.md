@@ -133,7 +133,27 @@ Last updated: 2026-11-05 (Europe/Berlin)
   gameplay. Signature as in `ret-8`/`chain3`: last completed work was `streamBuffer.cpp:183`
   copies after indirect dispatch `0x0ab3a7c64ccce901`; the next marked command (a tiler fill)
   never started.
-- **Where it stands (`tsc2`, ~19 FPS, a heavier scene):** GPU busy ~610 ms/s (~32 ms per
+- **Clean measurements of the current defaults:**
+  - `wskv-1..4` (verify loop, 150 s each): 0/4 device losses, **19.7–22.2 FPS** (mean ~21).
+  - `memo2` (perf log on, sampler off): **~22 FPS** at ~65k draws/s, 9.2 µs per draw;
+    PM4 thread ~930 ms/s.
+- **Per-thread CPU (`thr1`, `tools/perf/threads.ps1`):** the GPU thread uses 84% of a core
+  (the rest is GPU waits); no game thread is above 26%. The GPU thread is the bottleneck.
+- **Tried, no gain, reverted:** a per-thread memo of `TextureCache::FindImagesInRegion`
+  (generation-invalidated). `memo2` in-run A/B: 22.0 vs 21.9 FPS; render-target resolve
+  66.5 → 62.2 ms/s only.
+  - Note: `memo1` showed a fake +29% because chaining and side readbacks still followed
+    `KYTY_AB_PERIOD`. Both are now always on (only their env switches disable them), so the
+    A/B toggle is free for new experiments.
+- **What 30 FPS needs:** per frame ~2,950 draws × 9.2 µs ≈ 27 ms plus ~1,000 dispatches ×
+  ~8 µs ≈ 8 ms of GPU-thread CPU work, before waits; the budget is 33 ms.
+  - Per-draw cost must drop ~40%, or work must leave the GPU thread.
+  - Remaining exclusive costs: driver ~11%, exceptions (walker loads ~7.7k/s + GPU-thread write
+    faults) ~4–5%, page re-protection (`NtProtectVirtualMemory`) ~3%, Vulkan memory
+    allocate/free ~2%, `memmove` ~2%, materialization ~2%.
+  - The structural options: an async Vulkan recording thread (driver and emulator record code,
+    ~20% of the thread), or GPU-side descriptor resolution.
+- **Where it stood earlier (`tsc2`, ~19 FPS, a heavier scene):** GPU busy ~610 ms/s (~32 ms per
   frame); PM4 thread ~914 ms/s, draws ~9.3 µs each.
   - Both CPU and GPU must shrink ~35% for a stable 30.
   - CPU candidates per draw: program lookup/materialization (~3.7 µs), render-target re-resolve
