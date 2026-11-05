@@ -74,6 +74,9 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
 // one DWORD range per guest load. False when a reachable read is unknown.
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads);
+// Byte offsets in the walker scratch of the activity bytes and of the walked values; descriptor
+// words precede the first, and walker-internal slots and captured addresses follow the values.
+void SrtScratchLayout(const ResourcePlan& plan, uint32_t& active_offset, uint32_t& output_offset);
 // Results of the last walk; false when unknown.
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
 bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);

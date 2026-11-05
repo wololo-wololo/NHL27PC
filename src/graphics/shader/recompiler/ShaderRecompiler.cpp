@@ -19,7 +19,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <functional>
 #include <map>
@@ -27,6 +30,24 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
+
+bool TargetedDumpRequested(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		const char*           value = std::getenv("KYTY_DUMP_SHADERS");
+		for (const char* p = value; p != nullptr && *p != '\0';) {
+			char*          end  = nullptr;
+			const uint64_t hash = std::strtoull(p, &end, 16);
+			if (end == p) {
+				break;
+			}
+			list.push_back(hash);
+			p = *end == ',' ? end + 1 : end;
+		}
+		return list;
+	}();
+	return std::find(hashes.begin(), hashes.end(), shader_hash) != hashes.end();
+}
 
 namespace {
 
@@ -55,6 +76,15 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
 	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
+	// Dispatcher shaders run far slower on the host; keep them visible in the console log.
+	static std::atomic<uint32_t> printed {0};
+	if (printed.fetch_add(1, std::memory_order_relaxed) < 100) {
+		std::printf("shader dispatcher fallback: %s 0x%016" PRIx64 " phase=%s blocks=%" PRIu64
+		            " reason=%s\n",
+		            StageName(options.stage), options.shader_hash, phase,
+		            static_cast<uint64_t>(cfg.blocks.size()), cfg.unsupported_reason.c_str());
+		std::fflush(stdout);
+	}
 }
 
 enum class EmbeddedFetchValueType {
@@ -945,6 +975,14 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
+	if (options.dump_ir && TargetedDumpRequested(ir.shader_hash)) {
+		const auto name = fmt::format("shader-{:016x}-{}.txt", ir.shader_hash, stage);
+		if (std::FILE* out = std::fopen(name.c_str(), "w")) {
+			std::fprintf(out, "== decoded RDNA2 ==\n%s\n== IR ==\n%s\n",
+			             translated.decoded_dump.c_str(), ir_dump.c_str());
+			std::fclose(out);
+		}
+	}
 	CompileResult result;
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);

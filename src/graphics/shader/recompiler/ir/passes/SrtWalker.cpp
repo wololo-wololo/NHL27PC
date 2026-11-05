@@ -1382,6 +1382,11 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	return true;
 }
 
+void SrtScratchLayout(const ResourcePlan& plan, uint32_t& active_offset, uint32_t& output_offset) {
+	active_offset = ActiveOffset(plan);
+	output_offset = OutputOffset(plan);
+}
+
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result) {
 	value = value.Resolve();
 	uint64_t bits = 0;

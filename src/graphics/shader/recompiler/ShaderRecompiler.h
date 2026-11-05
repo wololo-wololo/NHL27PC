@@ -69,6 +69,10 @@ struct ShaderSource {
 };
 
 [[nodiscard]] const char* StageName(ShaderType stage);
+// KYTY_DUMP_SHADERS=hash[,hash...] (hex): write decoded RDNA2 + IR of these shaders to
+// shader-<hash>-<stage>.txt in the working directory.
+[[nodiscard]] bool TargetedDumpRequested(uint64_t shader_hash);
+
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);

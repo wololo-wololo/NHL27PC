@@ -237,6 +237,10 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 			if (!complete()) {
 				return false;
 			}
+			// Recompile shaders selected by KYTY_DUMP_SHADERS so their dumps are written.
+			if (ShaderRecompiler::TargetedDumpRequested(key.hash)) {
+				break;
+			}
 			const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
 			if (inserted &&
 			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {

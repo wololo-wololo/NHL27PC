@@ -765,12 +765,24 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		const auto vote = IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
 		return zero ? ir.LogicalNot(vote) : vote;
 	};
+	// A lowered jump-table case: the selector is scalar, so the compare needs no lane vote.
+	const auto indirect_case = [&](uint32_t selector, uint32_t value) -> IR::U1 {
+		const auto current =
+		    (selector & CFG::IndirectCasePcSgpr) != 0u
+		        ? ir.GetScalarReg(static_cast<IR::ScalarReg>(selector & ~CFG::IndirectCasePcSgpr))
+		        : ReadScalarCode(selector);
+		const auto equal = ir.IEqual(current, IR::U32(IR::Value(value)));
+		return IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {equal},
+		                      CFG::BranchCondition::ScalarInstruction));
+	};
 	const auto expression = [&](auto&& self, uint32_t index) -> IR::U1 {
 		const auto& value = graph.expressions.at(index);
 		switch (value.op) {
 			case CFG::ConditionExpression::Op::Constant: return IR::U1(IR::Value(value.lhs != 0));
 			case CFG::ConditionExpression::Op::Variable: return ir.GetGotoVariable(value.lhs);
 			case CFG::ConditionExpression::Op::Native:
+				if (static_cast<CFG::BranchCondition>(value.lhs) == CFG::BranchCondition::IndirectCase)
+					return indirect_case(value.selector, value.rhs);
 				return native_condition(static_cast<CFG::BranchCondition>(value.lhs));
 			case CFG::ConditionExpression::Op::Not: return ir.LogicalNot(self(self, value.lhs));
 			case CFG::ConditionExpression::Op::Or:
@@ -796,6 +808,8 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 	if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
 		const auto condition = term.expression != UINT32_MAX
 		                           ? expression(expression, term.expression)
+		                       : term.condition == CFG::BranchCondition::IndirectCase
+		                           ? indirect_case(term.case_selector, term.case_value)
 		                           : native_condition(term.condition);
 		info.condition = condition;
 		ir.Emit(IR::ValueOpcode::Reference, {condition});

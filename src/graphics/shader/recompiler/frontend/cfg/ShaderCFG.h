@@ -19,15 +19,23 @@ enum class BranchCondition {
 	ExecZero,
 	ExecNonZero,
 	ScalarInstruction,
+	// One case of a lowered S_SETPC_B64 jump table: the (uniform) selector equals a case value.
+	IndirectCase,
 	Expression,
 	Unknown
 };
+
+// Selector of an IndirectCase: a scalar operand code (jump-table index), or the low SGPR of the
+// target PC when tagged with IndirectCasePcSgpr.
+constexpr uint32_t IndirectCasePcSgpr = 0x80000000u;
 
 struct ConditionExpression {
 	enum class Op { Constant, Variable, Native, Not, Or };
 	Op       op;
 	uint32_t lhs;
 	uint32_t rhs = UINT32_MAX;
+	// Native IndirectCase only: selector (rhs holds the case value).
+	uint32_t selector = UINT32_MAX;
 };
 
 enum class TerminatorKind { Branch, ConditionalBranch, IndirectBranch, Return, Unsupported };
@@ -57,6 +65,8 @@ struct Terminator {
 	std::vector<uint32_t> indirect_selector_values;
 	std::vector<uint32_t> indirect_selector_targets;
 	uint32_t              expression    = UINT32_MAX;
+	uint32_t              case_selector = UINT32_MAX; // IndirectCase condition operands
+	uint32_t              case_value    = 0;
 	bool                  loop_header   = false;
 };
 

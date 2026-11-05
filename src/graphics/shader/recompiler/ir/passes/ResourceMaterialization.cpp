@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -10,6 +11,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
@@ -1768,6 +1771,77 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+// Indirect descriptors, captured reads and indirect arguments read guest memory or the image
+// heap after the walk, so their results are not determined by the walk alone.
+static bool MemoizablePlan(const ResourcePlan& program, const SrtRuntime& runtime) {
+	// Opt-in: in NHL 27 gameplay most refreshes see new descriptor values, so the extra walk of
+	// a miss outweighs the ~16% of refreshes that repeat.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MATERIALIZE_CACHE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled && program.resource_tracking_complete && program.srt_code != nullptr &&
+	       !program.capture_specialization_reads && program.source_reads.empty() &&
+	       program.selector_keys.empty() && runtime.indirect_args_address == 0u &&
+	       std::ranges::none_of(program.descriptor_sources, [](const DescriptorSource& source) {
+		       return source.indirect_descriptor.has_value();
+	       });
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          MaterializeMemo& memo) {
+	using Common::DebugCounters::Counter;
+	if (!MemoizablePlan(program, runtime)) {
+		memo.Invalidate();
+		return MaterializeResources(program, runtime, snapshot, specialization);
+	}
+	if (memo.valid && memo.shader_base == runtime.shader_base &&
+	    WalkSrt(program, runtime, memo.flat, nullptr) && memo.flat == snapshot.flattened_srt &&
+	    program.srt_scratch == memo.scratch) {
+		snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+		Common::DebugCounters::Add(Counter::MaterializeHits);
+		return true;
+	}
+	Common::DebugCounters::Add(Counter::MaterializeMisses);
+	if (memo.valid && Common::DebugCounters::Enabled() &&
+	    memo.scratch.size() == program.srt_scratch.size()) {
+		uint32_t active = 0;
+		uint32_t output = 0;
+		SrtScratchLayout(program, active, output);
+		const auto* now  = reinterpret_cast<const uint8_t*>(program.srt_scratch.data());
+		const auto* then = reinterpret_cast<const uint8_t*>(memo.scratch.data());
+		const auto  bytes = memo.scratch.size() * sizeof(uint64_t);
+		const auto  differs = [&](uint32_t begin, uint64_t end) {
+			return std::memcmp(now + begin, then + begin, std::min<uint64_t>(end, bytes) - begin) != 0;
+		};
+		if (memo.flat != snapshot.flattened_srt) Common::DebugCounters::Add(Counter::MissFlat);
+		if (differs(0, active)) {
+			Common::DebugCounters::Add(Counter::MissDescriptors);
+			bool base_only = true;
+			for (uint32_t offset = 0; offset < active && base_only; offset += 4u) {
+				const auto word = (offset / 4u) % 9u;
+				base_only = word < 2u || std::memcmp(now + offset, then + offset, 4u) == 0;
+			}
+			if (base_only) Common::DebugCounters::Add(Counter::MissDescriptorBaseOnly);
+		} else if (differs(active, output)) {
+			Common::DebugCounters::Add(Counter::MissActive);
+		} else if (differs(output, program.srt_captures)) {
+			Common::DebugCounters::Add(Counter::MissOutputs);
+		} else {
+			Common::DebugCounters::Add(Counter::MissInternal);
+		}
+	}
+	memo.Invalidate();
+	if (!MaterializeResources(program, runtime, snapshot, specialization)) {
+		return false;
+	}
+	memo.valid       = true;
+	memo.shader_base = runtime.shader_base;
+	memo.scratch     = program.srt_scratch;
+	return true;
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {

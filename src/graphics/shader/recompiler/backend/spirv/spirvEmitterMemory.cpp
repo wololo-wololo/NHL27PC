@@ -376,12 +376,51 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
 }
 
+// The guest GPU runs with unaligned memory access enabled: a dword buffer access at a byte
+// address that is not a multiple of 4 reads/writes those exact 4 bytes. NHL 27 binds 16-bit
+// (stride 2) buffers at 2-byte-aligned bases and accesses them with dword loads/stores;
+// truncating to the aligned dword shifted the data and clobbered neighboring bytes (a corrupted
+// indirect instance count made a draw run ~135M instances and the host GPU time out).
+bool HandlesUnalignedWords(const IR::MemoryInfo& mem, const MemoryResourceAccess& resource) {
+	return mem.kind == IR::ResourceKind::Buffer && resource.element_bits == 32u;
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
-	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+	if (!HandlesUnalignedWords(mem, resource)) {
+		const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitStorageElementInBounds(ctx.state, resource, index),
+		    [&]() { return LoadWordInBounds(ctx, resource, index); });
+	}
+	auto&      state   = ctx.state;
+	const auto address = ByteAddress(ctx, inst, mem, resource.byte_offset);
+	const auto index =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
+	const auto byte =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), address, ConstantU32(state, 3));
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitStorageElementInBounds(ctx.state, resource, index),
-	    [&]() { return LoadWordInBounds(ctx, resource, index); });
+	    state, EmitStorageElementInBounds(state, resource, index), [&]() {
+		    const auto first = LoadWordInBounds(ctx, resource, index);
+		    const auto next  = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, 1));
+		    const auto misaligned =
+		        Binary(state, spv::OpINotEqual, TypeBool(state), byte, ConstantU32(state, 0));
+		    const auto second = EmitValueOrZeroIfCondition(
+		        state, AndCondition(state, misaligned, EmitStorageElementInBounds(state, resource, next)),
+		        [&]() { return LoadWordInBounds(ctx, resource, next); });
+		    // byte == 0: shift 0 and second == 0, so the result is the aligned word.
+		    const auto shift =
+		        Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
+		    const auto upper_shift = Binary(
+		        state, spv::OpShiftLeftLogical, TypeU32(state),
+		        Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		               Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 4), byte),
+		               ConstantU32(state, 3)),
+		        ConstantU32(state, 3));
+		    return Binary(state, spv::OpBitwiseOr, TypeU32(state),
+		                  Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, shift),
+		                  Binary(state, spv::OpShiftLeftLogical, TypeU32(state), second, upper_shift));
+	    });
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -633,11 +672,61 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	if (resource.object_pointer == 0u) return;
-	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+	if (!HandlesUnalignedWords(mem, resource)) {
+		const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+		const auto in_bounds = BufferIndexInBounds(ctx, inst, mem, resource,
+		    EmitStorageElementInBounds(ctx.state, resource, index));
+		EmitIfCondition(ctx.state, in_bounds, [&]() {
+			StoreWordInBounds(ctx, resource, index, data);
+		});
+		return;
+	}
+	auto&      state   = ctx.state;
+	const auto address = ByteAddress(ctx, inst, mem, resource.byte_offset);
+	const auto index =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
+	const auto byte =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), address, ConstantU32(state, 3));
+	const auto aligned =
+	    Binary(state, spv::OpIEqual, TypeBool(state), byte, ConstantU32(state, 0));
 	const auto in_bounds = BufferIndexInBounds(ctx, inst, mem, resource,
-	    EmitStorageElementInBounds(ctx.state, resource, index));
-	EmitIfCondition(ctx.state, in_bounds, [&]() {
+	    EmitStorageElementInBounds(state, resource, index));
+	EmitIfCondition(state, AndCondition(state, in_bounds, aligned), [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
+	});
+	// Unaligned: merge the low bytes into this dword and the rest into the next one. Atomic
+	// merges keep neighboring bytes written by other invocations intact.
+	const auto misaligned = Unary(state, spv::OpLogicalNot, TypeBool(state), aligned);
+	EmitIfCondition(state, AndCondition(state, in_bounds, misaligned), [&]() {
+		const auto shift =
+		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
+		const auto upper_shift =
+		    Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 32), shift);
+		const auto low_mask = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                             ConstantU32(state, 0xffffffffu), shift);
+		const auto low_value =
+		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), data, shift);
+		AtomicUpdate(state, EmitMemoryElementPointer(state, resource, index), mem.kind,
+		             [&](uint32_t old) {
+			             return Binary(state, spv::OpBitwiseOr, TypeU32(state),
+			                           Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
+			                                  Unary(state, spv::OpNot, TypeU32(state), low_mask)),
+			                           low_value);
+		             });
+		const auto next = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, 1));
+		EmitIfCondition(state, EmitStorageElementInBounds(state, resource, next), [&]() {
+			const auto high_mask = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+			                              ConstantU32(state, 0xffffffffu), upper_shift);
+			const auto high_value =
+			    Binary(state, spv::OpShiftRightLogical, TypeU32(state), data, upper_shift);
+			AtomicUpdate(state, EmitMemoryElementPointer(state, resource, next), mem.kind,
+			             [&](uint32_t old) {
+				             return Binary(state, spv::OpBitwiseOr, TypeU32(state),
+				                           Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
+				                                  Unary(state, spv::OpNot, TypeU32(state), high_mask)),
+				                           high_value);
+			             });
+		});
 	});
 }
 
@@ -1014,8 +1103,15 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 		                        IndirectBufferInBounds(state, buffer, component * 4u,
 		                                               ConstantU32(state, bits / 8u), false)),
 		    [&]() {
+			    if (bits == 32u) {
+				    // Unaligned dword loads read the exact bytes, as on the guest GPU.
+				    const auto exact =
+				        component == 0u ? buffer.address
+				                        : Binary(state, spv::OpIAdd, TypeU64(state), buffer.address,
+				                                 ConstantU64(state, component * 4u));
+				    return LoadBda(ctx, exact, ConstantBool(state, true), 32u, coherent);
+			    }
 			    const auto value = LoadBdaDword(ctx, address, coherent);
-			    if (bits == 32u) return value;
 			    const auto byte = Binary(
 			        state, spv::OpBitwiseAnd, TypeU32(state),
 			        Unary(state, spv::OpUConvert, TypeU32(state), buffer.address),

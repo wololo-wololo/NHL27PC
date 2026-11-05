@@ -62,6 +62,23 @@ bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePl
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// Walker results of a plan's last successful refresh. With only direct descriptors, everything
+// a refresh derives after the walk is a function of these results, so an identical walk leaves
+// the snapshot and specialization as they are.
+struct MaterializeMemo {
+	bool                  valid       = false;
+	uint64_t              shader_base = 0;
+	std::vector<uint64_t> scratch;
+	std::vector<uint32_t> flat;
+
+	void Invalidate() noexcept { valid = false; }
+};
+
+// MaterializeResources that skips the post-walk refresh when the walk repeats the memo's.
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          MaterializeMemo& memo);
+
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>
@@ -682,6 +683,84 @@ void PruneUnreachableBlocks(Graph& graph) {
 	RebuildPredecessors(graph);
 }
 
+std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> blocks);
+
+// Rewrites each resolved S_SETPC_B64 jump table into a chain of uniform compare-and-branch
+// blocks placed right after it, so the goto structurizer can handle the shader instead of the
+// (much slower) dispatcher loop. The last case is taken unconditionally: the jump-table index is
+// clamped by the guest, so every reachable selector value has a case. Returns false (graph
+// unchanged) if a table cannot be lowered.
+bool LowerIndirectBranches(Graph& graph) {
+	struct Case { uint32_t value; uint32_t target; };
+	const auto cases_of = [](const Terminator& term) {
+		std::vector<Case> cases;
+		const bool indexed = term.indirect_selector_code != UINT32_MAX;
+		const auto& values = indexed ? term.indirect_selector_values : term.indirect_target_pcs;
+		const auto& targets = indexed ? term.indirect_selector_targets : term.indirect_targets;
+		if (values.size() != targets.size()) return cases;
+		for (size_t i = 0; i < values.size(); i++) cases.push_back({values[i], targets[i]});
+		return cases;
+	};
+	for (const auto& block: graph.blocks) {
+		const auto& term = block.terminator;
+		if (term.kind != TerminatorKind::IndirectBranch) continue;
+		const bool has_selector = term.indirect_selector_code != UINT32_MAX ||
+		                          (term.indirect_pc_sgpr != UINT32_MAX &&
+		                           term.indirect_pc_sgpr < IndirectCasePcSgpr);
+		const auto cases = cases_of(term);
+		if (!has_selector || cases.empty() ||
+		    std::ranges::any_of(cases, [&](const Case& c) { return c.target >= graph.blocks.size(); })) {
+			return false;
+		}
+	}
+	auto next_id = static_cast<uint32_t>(graph.blocks.size());
+	std::vector<BasicBlock> ordered;
+	ordered.reserve(graph.blocks.size() * 2u);
+	for (auto& source: graph.blocks) {
+		if (source.terminator.kind != TerminatorKind::IndirectBranch) {
+			ordered.push_back(std::move(source));
+			continue;
+		}
+		const auto& old_term = source.terminator;
+		const auto cases = cases_of(old_term);
+		const auto selector = old_term.indirect_selector_code != UINT32_MAX
+		                          ? old_term.indirect_selector_code
+		                          : (IndirectCasePcSgpr | old_term.indirect_pc_sgpr);
+		const auto end_pc = source.end_pc;
+		const auto inst_end = source.inst_end;
+		ordered.push_back(std::move(source));
+		size_t current = ordered.size() - 1u;
+		for (size_t i = 0; i < cases.size(); i++) {
+			Terminator term {};
+			if (i + 1u == cases.size()) {
+				term.kind = TerminatorKind::Branch;
+				term.condition = BranchCondition::Always;
+				term.true_block = cases[i].target;
+				ordered[current].terminator = std::move(term);
+				ordered[current].successors = {cases[i].target};
+				break;
+			}
+			BasicBlock next {};
+			next.id = next_id++;
+			next.start_pc = next.end_pc = end_pc;
+			next.inst_begin = next.inst_end = inst_end;
+			term.kind = TerminatorKind::ConditionalBranch;
+			term.condition = BranchCondition::IndirectCase;
+			term.case_selector = selector;
+			term.case_value = cases[i].value;
+			term.true_block = cases[i].target;
+			term.false_block = next.id;
+			ordered[current].terminator = std::move(term);
+			ordered[current].successors = {cases[i].target, next.id};
+			ordered.push_back(std::move(next));
+			current = ordered.size() - 1u;
+		}
+	}
+	ApplyBlockOrder(graph, std::move(ordered));
+	RebuildPredecessors(graph);
+	return true;
+}
+
 void ComputeDominators(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
 	const auto all   = AllBlockIds(count);
@@ -1337,8 +1416,17 @@ private:
 					block.end_pc = source.end_pc;
 					block.inst_end = source.inst_end;
 					if (source.terminator.kind == TerminatorKind::ConditionalBranch) {
-						block.assignments.push_back({CaptureVariable(source.id),
-						    Expression(ExprOp::Native, static_cast<uint32_t>(source.terminator.condition))});
+						const auto& term = source.terminator;
+						uint32_t native = 0;
+						if (term.condition == BranchCondition::IndirectCase) {
+							native = static_cast<uint32_t>(m_graph.expressions.size());
+							m_graph.expressions.push_back({ExprOp::Native,
+							                               static_cast<uint32_t>(term.condition),
+							                               term.case_value, term.case_selector});
+						} else {
+							native = Expression(ExprOp::Native, static_cast<uint32_t>(term.condition));
+						}
+						block.assignments.push_back({CaptureVariable(source.id), native});
 					}
 					break;
 				}
@@ -1647,6 +1735,12 @@ Graph BuildGraph(const Decoder::Program& program) {
 		}
 	}
 	SortUnique(graph.code_table_load_pcs);
+	// KYTY_CFG_DISPATCH_JUMP_TABLES=1 keeps the old dispatcher fallback for jump tables (A/B).
+	static const bool keep_dispatcher = [] {
+		const char* value = std::getenv("KYTY_CFG_DISPATCH_JUMP_TABLES");
+		return value != nullptr && value[0] == '1';
+	}();
+	const bool lowered = indirect_setpc && !keep_dispatcher && LowerIndirectBranches(graph);
 
 	if (!indirect_setpc && std::ranges::any_of(program.instructions, [](const auto& inst) {
 		    return inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX;
@@ -1676,7 +1770,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 	RecomputeAnalyses(graph);
 
-	if (indirect_setpc) {
+	if (indirect_setpc && !lowered) {
 		graph.irreducible  = true;
 		graph.unsupported  = false;
 		graph.failure_kind = FailureKind::IrreducibleControlFlow;
@@ -1771,6 +1865,7 @@ std::string BranchConditionToString(BranchCondition condition) {
 		case BranchCondition::ExecZero: return "execz";
 		case BranchCondition::ExecNonZero: return "execnz";
 		case BranchCondition::ScalarInstruction: return "scalar_instruction";
+		case BranchCondition::IndirectCase: return "indirect_case";
 		case BranchCondition::Expression: return "expression";
 		default: return "unknown";
 	}
@@ -1826,6 +1921,9 @@ std::string GraphToString(const Graph& graph) {
 			const auto& expression = graph.expressions[assignment.expression];
 			if (expression.op == ConditionExpression::Op::Native)
 				text += fmt::format(" condition={}", BranchConditionToString(static_cast<BranchCondition>(expression.lhs)));
+			if (expression.op == ConditionExpression::Op::Native &&
+			    static_cast<BranchCondition>(expression.lhs) == BranchCondition::IndirectCase)
+				text += fmt::format(" selector=0x{:x} value=0x{:x}", expression.selector, expression.rhs);
 			text += "\n";
 		}
 	}
