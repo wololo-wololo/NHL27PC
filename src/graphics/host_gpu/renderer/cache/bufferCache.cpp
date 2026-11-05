@@ -6,6 +6,7 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/threadSampler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -442,7 +443,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferReadQueuedCalls);
 		}
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, queued] {
 		using Clock = std::chrono::steady_clock;
 		const bool profile = Common::DebugCounters::Enabled() && !is_write;
 		const auto body_begin = profile ? Clock::now() : Clock::time_point {};
@@ -470,6 +471,29 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				                  : m_scheduler.IsFree(producer) ? (is_write ? C::RbWriteProducerDone : C::RbProducerDone)
 				                                                 : (is_write ? C::RbWriteProducerInFlight : C::RbProducerInFlight);
 				Common::DebugCounters::Add(kind);
+				// KYTY_RB_TRACE=<seconds>: print readbacks starting that long after the first one.
+				static const char* rb_env     = std::getenv("KYTY_RB_TRACE");
+				static const bool  rb_trace   = rb_env != nullptr;
+				static const auto  rb_start   = Clock::now() + std::chrono::seconds(
+				                                                 rb_env != nullptr ? std::atoi(rb_env) : 0);
+				static uint32_t    traced     = 0;
+				if (rb_trace && traced < 3000 && Clock::now() >= rb_start) {
+					traced++;
+					const char* klass = producer == 0          ? "unknown"
+					                    : producer >= current  ? "recording"
+					                    : m_scheduler.IsFree(producer) ? "done"
+					                                                   : "inflight";
+					std::printf("RB %s %s req=0x%" PRIx64 "+0x%" PRIx64 " reader=0x%" PRIx64
+					            " writer=0x%" PRIx64 " age=%" PRIu64 " from_cpu_thread=%d\n",
+					            is_write ? "W" : "R", klass, vaddr, size, GpuReadbackReader(),
+					            m_write_writers.Max(vaddr, size),
+					            producer != 0 ? current - producer : 0, queued ? 1 : 0);
+					static uint32_t stacks = 0;
+					if (!queued && producer >= current && stacks < 12) {
+						stacks++;
+						Common::ThreadSampler::PrintCurrentStack("  readback stack");
+					}
+				}
 				if (producer != 0 && producer < current) {
 					Common::DebugCounters::Add(is_write ? C::RbWriteProducerAgeTicks : C::RbProducerAgeTicks,
 					                           current - producer);
@@ -865,6 +889,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		m_write_ticks.Assign(vaddr, size, m_scheduler.CurrentTick());
+		static const bool rb_trace = std::getenv("KYTY_RB_TRACE") != nullptr;
+		if (rb_trace) {
+			m_write_writers.Assign(vaddr, size, GpuReadbackReader());
+		}
 		static uint32_t assigns = 0;
 		if (++assigns % 4096u == 0u) {
 			m_write_ticks.Prune(m_scheduler.GetMasterSemaphore().KnownGpuTick());

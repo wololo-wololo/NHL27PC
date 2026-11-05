@@ -41,6 +41,7 @@
 #include <set>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -462,6 +463,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	Common::DebugCounters::StageSequence stages(Common::DebugCounters::Counter::CsProgramNs);
 	m_context.GetImageHeap().BeginDraw();
 	static const bool log_drops = std::getenv("KYTY_CHECK_GRID_UPLOADS") != nullptr;
+	GpuNoteReadbackReader(cs_regs.cs_regs.data_addr);
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) {
 		if (log_drops) {
 			static std::atomic<uint32_t> logged {0};
@@ -475,6 +477,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	GpuNoteCurrentDispatch({input_info.stage.module->info.shader_hash,
 	                        {thread_group_x, thread_group_y, thread_group_z}, false});
+	if (static const bool rb_trace = std::getenv("KYTY_RB_TRACE") != nullptr; rb_trace) {
+		static std::unordered_set<uint64_t> seen;
+		if (seen.size() < 2000 && seen.insert(cs_regs.cs_regs.data_addr).second) {
+			std::printf("CODE 0x%" PRIx64 " = shader 0x%016" PRIx64 "\n",
+			            static_cast<uint64_t>(cs_regs.cs_regs.data_addr),
+			            input_info.stage.module->info.shader_hash);
+		}
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -792,8 +802,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
 	m_context.GetImageHeap().BeginDraw();
+	GpuNoteReadbackReader(cs_regs.cs_regs.data_addr | (uint64_t {1} << 63u));
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
 	GpuNoteCurrentDispatch({input_info.stage.module->info.shader_hash, {0, 0, 0}, true});
+	if (static const bool rb_trace = std::getenv("KYTY_RB_TRACE") != nullptr; rb_trace) {
+		static std::unordered_set<uint64_t> seen;
+		if (seen.size() < 2000 && seen.insert(cs_regs.cs_regs.data_addr).second) {
+			std::printf("CODE 0x%" PRIx64 " = shader 0x%016" PRIx64 " (indirect)\n",
+			            static_cast<uint64_t>(cs_regs.cs_regs.data_addr),
+			            input_info.stage.module->info.shader_hash);
+		}
+	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;

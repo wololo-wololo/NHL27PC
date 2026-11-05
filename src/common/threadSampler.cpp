@@ -173,13 +173,28 @@ void RegisterCurrentThreadFromEnvironment(const char* name) {
 		const auto          until = std::chrono::steady_clock::now() +
 		                   std::chrono::duration_cast<std::chrono::steady_clock::duration>(
 		                       std::chrono::duration<double>(duration));
+		// Unwinding a thread suspended inside ntdll (exception dispatch, function-table updates)
+		// reads its half-updated state and crashed the sampler twice; such samples keep only the
+		// instruction pointer.
+		const auto ntdll = reinterpret_cast<uint64_t>(GetModuleHandleW(L"ntdll.dll"));
+		uint64_t   ntdll_size = 0;
+		if (ntdll != 0) {
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(ntdll);
+			const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(ntdll + dos->e_lfanew);
+			ntdll_size      = nt->OptionalHeader.SizeOfImage;
+		}
 		timeBeginPeriod(1);
 		while (std::chrono::steady_clock::now() < until && used < samples.size()) {
 			if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
 				CONTEXT context {};
 				context.ContextFlags = CONTEXT_FULL;
 				if (GetThreadContext(thread, &context) != 0) {
-					samples[used].count = Walk(context, samples[used].frames);
+					if (context.Rip - ntdll < ntdll_size) {
+						samples[used].frames[0] = context.Rip;
+						samples[used].count     = 1;
+					} else {
+						samples[used].count = Walk(context, samples[used].frames);
+					}
 					used++;
 				}
 				ResumeThread(thread);

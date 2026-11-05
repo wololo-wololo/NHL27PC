@@ -673,6 +673,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// downloading them only when they are GPU-written. Unprotecting the page instead would
 		// read back every GPU-written byte near it and wait for the whole GPU.
 		if (access == GpuAccess::Read) {
+			// A load that only decides reachability becomes unknown rather than reading GPU-written
+			// bytes back (which submits and waits for the GPU).
+			if (const auto skip = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerUnknownSkip(
+			        info->exception_address);
+			    skip != 0 && Libs::LibKernel::Memory::HasGpuDirtyBufferBytes(info->r10, 4)) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::WalkerLoadsUnknown);
+				Loader::X64InstructionEmulator::SkipLoad(info->native_context, skip);
+				return true;
+			}
 			if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
 			        info->exception_address)) {
 				uint32_t value = 0;

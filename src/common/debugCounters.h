@@ -4,8 +4,38 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <thread>
+#if defined(_MSC_VER) || defined(__clang__) || defined(__GNUC__)
+#include <x86intrin.h>
+#endif
 
 namespace Common::DebugCounters {
+
+// The stage timers run millions of times per second; steady_clock (QueryPerformanceCounter on
+// Windows) cost ~7% of the GPU thread. The invariant TSC, calibrated once, is far cheaper.
+struct FastClock {
+	using rep        = int64_t;
+	using period     = std::nano;
+	using duration   = std::chrono::nanoseconds;
+	using time_point = std::chrono::time_point<FastClock>;
+	static constexpr bool is_steady = true;
+
+	static double Calibrate() noexcept {
+		const auto     begin = std::chrono::steady_clock::now();
+		const uint64_t start = __rdtsc();
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		const auto     end   = std::chrono::steady_clock::now();
+		const uint64_t stop  = __rdtsc();
+		const double   ns    = static_cast<double>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+		return stop > start ? ns / static_cast<double>(stop - start) : 1.0;
+	}
+	static time_point now() noexcept {
+		static const double ns_per_tick = Calibrate();
+		// Never the default (zero) time point, which the timers use as "disabled".
+		return time_point(duration(static_cast<int64_t>(static_cast<double>(__rdtsc()) * ns_per_tick) | 1));
+	}
+};
 
 static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::is_always_lock_free);
 
@@ -151,6 +181,7 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::i
 	X(DrawPipelineNs) \
 	X(PopPendingNs) 	/* Relaxed compute barriers (KYTY_RELAXED_CS_BARRIERS). */ 	X(CsBarriersDeferred) 	X(CsBarriersElided) /* Dispatch-to-dispatch barriers left to guest synchronization. */ 	X(CsHazardsElided) 	X(CsBarriersFlushed) 	X(CsGuestSyncFlushes) 	/* Shader program lookup. */ 	X(DrawProgramsNs) 	X(DrawTargetsNs) 	X(ProgramKeyNs) 	X(ProgramMaterializeNs) 	X(ProgramMatchNs) 	X(ProgramLookups) 	X(MaterializeHits) 	X(MaterializeMisses) 	X(MissFlat) 	X(MissDescriptors) 	X(MissDescriptorBaseOnly) /* Only DWORDs 0-1 (buffer base) of descriptors differ. */ 	X(MissActive) 	X(MissOutputs) 	X(MissInternal) /* Only walker slots or captured addresses differ. */ 	/* GPU interrupts (RELEASE_MEM end-of-pipe events). */ 	X(InterruptsQueued) 	X(InterruptsDelivered) 	X(InterruptsUnregistered) /* Delivered while no event queue was registered for the id. */ 	/* Page protection and graphics binding preparation. */ 	X(ProtectCalls) 	X(ProtectNs) 	X(BindFindNs) 	X(BindBdaNs) 	X(BindImageHeapNs) 	X(BindImagesNs) 	X(BindTargetsNs) 	X(BindBuffersNs) \
 	X(WalkerLoadsEmulated) /* SRT walker loads completed from the backing store. */ \
+	X(WalkerLoadsUnknown) /* condition-only walker loads of GPU-written bytes left unknown */ \
 	/* GPU timestamps around submitted command buffers (KYTY_GPU_TIMING=1). */ \
 	X(GpuTimedSubmits) \
 	X(GpuBusyNs) \
@@ -191,15 +222,15 @@ class ScopedTimer final {
 public:
 	ScopedTimer(Counter count, Counter duration, Peak peak = Peak::Count)
 	    : m_count(count), m_duration(duration), m_peak(peak),
-	      m_start(Enabled() ? std::chrono::steady_clock::now()
-	                        : std::chrono::steady_clock::time_point {}) {}
+	      m_start(Enabled() ? FastClock::now()
+	                        : FastClock::time_point {}) {}
 	~ScopedTimer() {
-		if (m_start == std::chrono::steady_clock::time_point {} || !Enabled()) {
+		if (m_start == FastClock::time_point {} || !Enabled()) {
 			return;
 		}
 		const auto elapsed =
 		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-		                              std::chrono::steady_clock::now() - m_start)
+		                              FastClock::now() - m_start)
 		                              .count());
 		Add(m_count);
 		Add(m_duration, elapsed);
@@ -219,7 +250,7 @@ private:
 	Counter                               m_count;
 	Counter                               m_duration;
 	Peak                                  m_peak;
-	std::chrono::steady_clock::time_point m_start;
+	FastClock::time_point m_start;
 };
 
 [[nodiscard]] inline uint64_t Get(Counter counter) noexcept {
@@ -236,14 +267,14 @@ private:
 class StageTimer final {
 public:
 	explicit StageTimer(Counter duration)
-	    : m_duration(duration), m_start(Enabled() ? std::chrono::steady_clock::now()
-	                                              : std::chrono::steady_clock::time_point {}) {}
+	    : m_duration(duration), m_start(Enabled() ? FastClock::now()
+	                                              : FastClock::time_point {}) {}
 	~StageTimer() {
-		if (m_start == std::chrono::steady_clock::time_point {}) {
+		if (m_start == FastClock::time_point {}) {
 			return;
 		}
 		Add(m_duration, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-		                                          std::chrono::steady_clock::now() - m_start)
+		                                          FastClock::now() - m_start)
 		                                          .count()));
 	}
 	StageTimer(const StageTimer&)            = delete;
@@ -251,7 +282,7 @@ public:
 
 private:
 	Counter                               m_duration;
-	std::chrono::steady_clock::time_point m_start;
+	FastClock::time_point m_start;
 };
 
 // Splits a function into consecutive stages; each Next() charges the time since the previous
@@ -259,26 +290,26 @@ private:
 class StageSequence final {
 public:
 	explicit StageSequence(Counter first)
-	    : m_current(first), m_start(Enabled() ? std::chrono::steady_clock::now()
-	                                          : std::chrono::steady_clock::time_point {}) {}
-	~StageSequence() { Flush(std::chrono::steady_clock::time_point {}); }
+	    : m_current(first), m_start(Enabled() ? FastClock::now()
+	                                          : FastClock::time_point {}) {}
+	~StageSequence() { Flush(FastClock::time_point {}); }
 	void Next(Counter stage) {
-		if (m_start == std::chrono::steady_clock::time_point {}) {
+		if (m_start == FastClock::time_point {}) {
 			return;
 		}
-		Flush(std::chrono::steady_clock::now());
+		Flush(FastClock::now());
 		m_current = stage;
 	}
 	StageSequence(const StageSequence&)            = delete;
 	StageSequence& operator=(const StageSequence&) = delete;
 
 private:
-	void Flush(std::chrono::steady_clock::time_point next_start) {
-		if (m_start == std::chrono::steady_clock::time_point {}) {
+	void Flush(FastClock::time_point next_start) {
+		if (m_start == FastClock::time_point {}) {
 			return;
 		}
-		const auto now = next_start == std::chrono::steady_clock::time_point {}
-		                     ? std::chrono::steady_clock::now()
+		const auto now = next_start == FastClock::time_point {}
+		                     ? FastClock::now()
 		                     : next_start;
 		Add(m_current, static_cast<uint64_t>(
 		                   std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_start)
@@ -287,7 +318,7 @@ private:
 	}
 
 	Counter                               m_current;
-	std::chrono::steady_clock::time_point m_start;
+	FastClock::time_point m_start;
 };
 
 // Time spent per PM4 type-3 opcode, inclusive of the host work the packet handler performs.
@@ -342,15 +373,15 @@ inline void AddOpcode(uint32_t slot, uint64_t ns) noexcept {
 class OpcodeTimer final {
 public:
 	explicit OpcodeTimer(uint32_t slot)
-	    : m_slot(slot), m_start(Enabled() ? std::chrono::steady_clock::now()
-	                                      : std::chrono::steady_clock::time_point {}) {}
+	    : m_slot(slot), m_start(Enabled() ? FastClock::now()
+	                                      : FastClock::time_point {}) {}
 	~OpcodeTimer() {
-		if (m_start == std::chrono::steady_clock::time_point {}) {
+		if (m_start == FastClock::time_point {}) {
 			return;
 		}
 		AddOpcode(m_slot, static_cast<uint64_t>(
 		                      std::chrono::duration_cast<std::chrono::nanoseconds>(
-		                          std::chrono::steady_clock::now() - m_start)
+		                          FastClock::now() - m_start)
 		                          .count()));
 	}
 	OpcodeTimer(const OpcodeTimer&)            = delete;
@@ -358,7 +389,7 @@ public:
 
 private:
 	uint32_t                              m_slot;
-	std::chrono::steady_clock::time_point m_start;
+	FastClock::time_point m_start;
 };
 
 // In-run A/B testing: KYTY_AB_PERIOD=N alternates the variant every N seconds and tags each

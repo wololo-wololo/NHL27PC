@@ -179,6 +179,8 @@ private:
 	std::vector<PendingUpload> m_pending_uploads;
 	// Tick of the latest GPU write per guest range (ObtainBuffer with is_written).
 	TickRangeMap               m_write_ticks;
+	// KYTY_RB_TRACE=1: code address of the latest writer per range (readback attribution).
+	TickRangeMap               m_write_writers;
 	// Downloads whose producers are already submitted run on GraphicContext::readback_queue,
 	// waiting only for the producer's tick instead of everything queued on the main queue.
 	[[nodiscard]] bool DownloadOnSideQueue(Buffer& buffer, uint64_t vaddr, uint64_t size,

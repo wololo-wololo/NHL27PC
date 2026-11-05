@@ -875,6 +875,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
+	GpuNoteReadbackReader(buffer.GetShaders().GetPs().ps_regs.data_addr | (uint64_t {1} << 62u));
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	prep_stages.Next(Common::DebugCounters::Counter::DrawTargetsNs);
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not

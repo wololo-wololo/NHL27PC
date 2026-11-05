@@ -316,6 +316,18 @@ const GpuCurrentDispatch& GpuGetCurrentDispatch() {
 	return t_current_dispatch;
 }
 
+namespace {
+thread_local uint64_t t_readback_reader = 0;
+} // namespace
+
+void GpuNoteReadbackReader(uint64_t code_address) {
+	t_readback_reader = code_address;
+}
+
+uint64_t GpuReadbackReader() {
+	return t_readback_reader;
+}
+
 void ReportRetiredRecording(const char* what, uint64_t shader_hash) {
 	static std::atomic<uint32_t> reported {0};
 	if (reported.fetch_add(1, std::memory_order_relaxed) < 50) {

@@ -91,6 +91,55 @@ Last updated: 2026-11-05 (Europe/Berlin)
   - CPU: draw processing ~380 ms/s (~10 µs per draw, ~38k draws/s); dispatch ~220 ms/s.
   - Waits: the remaining 34/s "producer just recorded" reads.
 
+### Toward a stable 30 FPS (2026-11-05, night; newest)
+
+- **Baseline (`base30`, with the sampler and GPU timing on):** 17.5 FPS.
+  - PM4 thread ~934 ms/s, saturated. Draws ~10 µs each (44k/s); direct dispatches 263 ms/s,
+    121 ms/s of it readbacks; GPU waits 269 ms/s.
+  - GPU busy 546 ms/s (~31 ms per frame).
+- **Readback trace (`KYTY_RB_TRACE=<s>`, prints each readback's reader/writer code address).**
+  - 99% of the readbacks whose producer was still being recorded were **4-byte reads** by four
+    compute shaders (`0x3f9a9a1ddb4d76ab`, `0xa2932b1ddf6e6544`, `0x9ad619ecb118aaaf`,
+    `0x784af6a8839215ae`). Each read a counter that the previous dispatch had just written on
+    the GPU.
+  - The read happens in the SRT walker (JIT x64 run on the GPU thread for descriptor
+    materialization). Its load faults on the GPU-written page, and the handler reads the value
+    back (`runtimeLinker.cpp` → `TryReadBufferBacking`).
+  - E.g. `0x9ad6`: `count = s_buffer_load(...)`, `if (tid < count) {...}`. The value only
+    decides block reachability (resource activity); the descriptors come from a CPU-known table.
+- **Fix (in the tree, on by default): condition-only walker loads.**
+  - `WalkerCompiler::Compile` marks nodes that no descriptor, flat read or output depends on
+    (`Node::condition_only`). Their loads are emitted as
+    `mov eax,[r10]; jmp short +5; jmp <unknown>`.
+  - When such a load faults on GPU-dirty bytes, the handler skips into the unknown path
+    (`SrtWalkerUnknownSkip`) instead of reading back. An unknown condition makes both
+    successors reachable, so the resources stay active (conservative).
+  - Counter `WalkerLoadsUnknown`; `KYTY_WALKER_SKIP_GPU_CONDITIONS=0` disables it.
+  - `wsk1` (same settings as `base30`): 17.5 → 20.5 FPS.
+    - Readbacks with the producer still recording: 54 → 0.3/s; GPU waits 109 → 58/s
+      (269 → 138 ms/s); dispatch processing 359 → 187 ms/s.
+    - Draws/s 44k → 59k; screenshots correct.
+- **Cheaper stage timers.** `steady_clock` (`QueryPerformanceCounter`) in the debug-counter
+  timers cost ~6.5% of the GPU thread. They now use a calibrated invariant TSC
+  (`DebugCounters::FastClock`): QPC share 6.5% → 2.5%, ~9.8 → 9.3 µs per draw. This only
+  matters when the perf log/overlay is on.
+- **Sampler crash fixed.**
+  - Two runs (`mip1`, `tsc1`) died in `ntdll+0x20191`: ntdll's function-table lookup, with
+    `rbp`/`r13` = the emulator image base, during sampler windows. The sampler unwound the
+    suspended GPU thread while that thread was inside ntdll; it raises thousands of
+    exceptions per second for walker loads.
+  - The sampler now records only RIP for samples taken inside ntdll.
+- **Rare device loss still exists.** `wsk0` (walker skip off) lost the device ~44 s into
+  gameplay. Signature as in `ret-8`/`chain3`: last completed work was `streamBuffer.cpp:183`
+  copies after indirect dispatch `0x0ab3a7c64ccce901`; the next marked command (a tiler fill)
+  never started.
+- **Where it stands (`tsc2`, ~19 FPS, a heavier scene):** GPU busy ~610 ms/s (~32 ms per
+  frame); PM4 thread ~914 ms/s, draws ~9.3 µs each.
+  - Both CPU and GPU must shrink ~35% for a stable 30.
+  - CPU candidates per draw: program lookup/materialization (~3.7 µs), render-target re-resolve
+    (`ResolveRenderColorTarget` rebuilds the full description + `UpdateSize` every draw, ~4%
+    of the thread), driver calls (~10%), buffer uploads (~6%), side readbacks (~6%).
+
 ### Chaining "crash" re-tested (2026-11-05, latest)
 
 - **Chaining no longer loses the device.** Solver allowlist, 150 s of gameplay per run unless

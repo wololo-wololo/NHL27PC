@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -171,6 +172,18 @@ thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 	code.lea(code.r10, code.ptr[address]);
 	code.mov(code.eax, code.dword[code.r10]);
+}
+
+// A condition-only load is followed by `jmp short +5; jmp unknown`. The fault handler may skip
+// the load and the short jump (SrtWalkerUnknownSkip), making the value unknown instead of
+// reading GPU-written bytes back.
+void LoadGuestOrUnknown(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address,
+                        const Xbyak::Label& unknown) {
+	LoadGuest(code, address);
+	Xbyak::Label known;
+	code.jmp(known, Xbyak::CodeGenerator::T_SHORT);
+	code.jmp(unknown, Xbyak::CodeGenerator::T_NEAR);
+	code.L(known);
 }
 
 class RuntimeValidator {
@@ -396,6 +409,9 @@ private:
 		uint32_t             slot = 0, state = 0;
 		Xbyak::Label         label;
 		bool                 pending = true, referenced = false, masked = false;
+		// Feeds only block conditions (reachability), never a descriptor, flat read or output:
+		// an unknown value just makes both successors reachable.
+		bool                 condition_only = false;
 	};
 
 	static constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
@@ -932,7 +948,11 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax);
+			if (node.condition_only) {
+				LoadGuestOrUnknown(c, c.rax, m_ret);
+			} else {
+				LoadGuest(c, c.rax);
+			}
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -962,7 +982,11 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
+			if (node.condition_only) {
+				LoadGuestOrUnknown(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_ret);
+			} else {
+				LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
+			}
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1212,6 +1236,36 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
 	Layout();
+	{
+		// Values a descriptor, flat read or output depends on must stay exact; any other node
+		// only feeds block conditions.
+		std::vector<bool> needed(m_nodes.size(), false);
+		std::vector<uint32_t> pending;
+		const auto need = [&](const Operand& operand) {
+			if (operand.kind == Kind::Node && operand.value < needed.size() && !needed[operand.value]) {
+				needed[operand.value] = true;
+				pending.push_back(static_cast<uint32_t>(operand.value));
+			}
+		};
+		for (const auto& operand: reads) need(operand);
+		for (const auto& words: descriptors)
+			for (const auto& operand: words) need(operand);
+		for (const auto& operand: outputs) need(operand);
+		while (!pending.empty()) {
+			const auto index = pending.back();
+			pending.pop_back();
+			const auto& node = m_nodes[index];
+			need(node.result);
+			for (const auto& arg: node.args) need(arg);
+		}
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_WALKER_SKIP_GPU_CONDITIONS");
+			return value == nullptr || value[0] != '0';
+		}();
+		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+			m_nodes[index].condition_only = enabled && !needed[index];
+		}
+	}
 
 	Xbyak::Label pass, fail, reset;
 	c.mov(c.qword[c.rdx + m_shader_base], c.rcx);
@@ -1436,6 +1490,17 @@ uint32_t SrtWalkerLoadLength(uint64_t rip) {
 		return 0;
 	const auto* code = reinterpret_cast<const uint8_t*>(rip);
 	return code[0] == 0x41u && code[1] == 0x8bu && code[2] == 0x02u ? 3 : 0;
+}
+
+uint32_t SrtWalkerUnknownSkip(uint64_t rip) {
+	const auto length = SrtWalkerLoadLength(rip);
+	if (length == 0 ||
+	    rip + length + 7u - reinterpret_cast<uint64_t>(t_running_walker->getCode()) >
+	        t_running_walker->getSize())
+		return 0;
+	// mov eax, [r10]; jmp short +5; jmp near <unknown>
+	const auto* code = reinterpret_cast<const uint8_t*>(rip + length);
+	return code[0] == 0xebu && code[1] == 0x05u && code[2] == 0xe9u ? length + 2u : 0;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

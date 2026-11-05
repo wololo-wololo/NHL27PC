@@ -85,6 +85,9 @@ bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
+// For a walker load whose value only feeds block conditions: the bytes to skip so the value
+// becomes unknown (both successors reachable) instead of being read. 0 for any other load.
+uint32_t SrtWalkerUnknownSkip(uint64_t rip);
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.

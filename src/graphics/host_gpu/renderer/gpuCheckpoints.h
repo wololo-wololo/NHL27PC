@@ -89,6 +89,9 @@ struct GpuCurrentDispatch {
 };
 void                      GpuNoteCurrentDispatch(const GpuCurrentDispatch& dispatch);
 const GpuCurrentDispatch& GpuGetCurrentDispatch();
+// Code address of the draw/dispatch whose program lookup is running (readback attribution).
+void     GpuNoteReadbackReader(uint64_t code_address);
+uint64_t GpuReadbackReader();
 
 // Reports a draw or dispatch whose commands went into a Vulkan buffer that was submitted while
 // the command was being prepared (those commands never execute).
