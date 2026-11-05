@@ -322,6 +322,16 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	// Guest levels beyond the host's full chain are 1x1 copies of the last level's size; map a
+	// view of them to the host's last level (see the Image constructor).
+	if (image.mip_levels != 0 && image.mip_levels < info.resources.levels &&
+	    normalized.level_count != 0) {
+		if (normalized.base_level >= image.mip_levels) {
+			normalized.base_level  = image.mip_levels - 1u;
+			normalized.level_count = 1;
+		}
+		normalized.level_count = std::min(normalized.level_count, image.mip_levels - normalized.base_level);
+	}
 	for (const auto& cached: views) {
 		if (cached.info == normalized) {
 			return cached.view;

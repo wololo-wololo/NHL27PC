@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -689,30 +690,67 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = runtime.module->info;
 	const auto& snapshot = *runtime.resources;
+	const bool  same_module = prepared.cached_module == runtime.module;
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
 	prepared.images.resize(program.info.images.size());
-	prepared.samplers.clear();
+	prepared.image_descriptors.resize(program.info.images.size());
+	prepared.samplers.resize(program.info.samplers.size());
+	prepared.sampler_descriptors.resize(program.info.samplers.size());
 	prepared.shader_data.clear();
+	uint64_t image_reuses     = 0;
+	uint64_t image_resolves   = 0;
+	uint64_t sampler_reuses   = 0;
+	uint64_t sampler_resolves = 0;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (program.info.images[i].heap) {
 			prepared.images[i] = {};
+			prepared.image_descriptors[i] = snapshot.images[i];
 			continue;
 		}
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		auto& binding = prepared.images[i];
+		const auto& descriptor = snapshot.images[i];
+		const bool reusable = [&] {
+			if (!same_module || prepared.image_descriptors[i] != descriptor || !binding.image_id) {
+				return false;
+			}
+			const auto& image = m_context.GetTextureCache().m_slot_images[binding.image_id];
+			return image.registered && !image.binding.needs_rebind;
+		}();
+		if (reusable) {
+			image_reuses++;
+		} else {
+			image_resolves++;
+			auto resolved = ResolveTexture(program.info.images[i], descriptor);
+			resolved.mip_views.swap(binding.mip_views);
+			resolved.mip_views.clear();
+			binding = std::move(resolved);
+		}
+		prepared.image_descriptors[i] = descriptor;
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
-		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
 	}
-	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		const auto& descriptor = snapshot.samplers[program.info.samplers[i].snapshot_index];
+		if (same_module && prepared.sampler_descriptors[i] == descriptor && prepared.samplers[i]) {
+			sampler_reuses++;
+		} else {
+			sampler_resolves++;
+			prepared.samplers[i] = NativeSampler(m_context, program, i, descriptor);
+		}
+		prepared.sampler_descriptors[i] = descriptor;
 	}
+	prepared.cached_module = runtime.module;
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BindingImageReuses,
+	                           image_reuses);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BindingImageResolves,
+	                           image_resolves);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BindingSamplerReuses,
+	                           sampler_reuses);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BindingSamplerResolves,
+	                           sampler_resolves);
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
@@ -866,20 +904,25 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma        = false;
 	bool uses_image_heap = false;
+	Common::DebugCounters::StageSequence bind_stages(Common::DebugCounters::Counter::BindFindNs);
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		uses_dma |= stage->runtime->module->info.info.uses_dma;
 		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
 	}
+	bind_stages.Next(Common::DebugCounters::Counter::BindBdaNs);
 	if (uses_dma) {
 		m_context.PrepareBda();
 	}
+	bind_stages.Next(Common::DebugCounters::Counter::BindImageHeapNs);
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
 	}
+	bind_stages.Next(Common::DebugCounters::Counter::BindImagesNs);
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
+	bind_stages.Next(Common::DebugCounters::Counter::BindTargetsNs);
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
@@ -894,6 +937,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	bind_stages.Next(Common::DebugCounters::Counter::BindBuffersNs);
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}

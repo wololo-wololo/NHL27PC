@@ -17,6 +17,7 @@
 namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
+struct ShaderModule;
 
 struct TextureBinding {
 	ImageId                    image_id;
@@ -35,12 +36,17 @@ struct PreparedBindings {
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+	// Raw descriptors are retained independently of the mutable program snapshot. This lets a
+	// later draw reuse decoded native bindings without dereferencing the previous draw's runtime.
+	const ShaderModule* cached_module = nullptr;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> image_descriptors;
 	std::vector<vk::Sampler>              samplers;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> sampler_descriptors;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;

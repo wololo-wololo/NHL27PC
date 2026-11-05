@@ -15,6 +15,10 @@ vk::MemoryBarrier       MakeShaderWriteHazardDependency();
 vk::MemoryBarrier       MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
+// Guest bases of the first written and the first read-only bound buffer (0 if none).
+std::pair<uint64_t, uint64_t> FirstBufferBases(const ShaderStageRuntime& runtime);
+// Logs (first 200) bound buffers whose guest base is not 4-byte aligned.
+void LogUnalignedBufferBases(const ShaderStageRuntime& runtime, uint64_t shader_hash);
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
 void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
                               vk::PipelineStageFlags destination_stages);

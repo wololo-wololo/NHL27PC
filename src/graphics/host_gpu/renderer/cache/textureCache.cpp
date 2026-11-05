@@ -7,7 +7,10 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/gpuCheckpoints.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -19,11 +22,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <span>
 #include <tuple>
 #include <utility>
@@ -562,6 +570,58 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 	return true;
 }
 
+// KYTY_CHECK_GRID_UPLOADS=1: who writes R32G32_UINT images (NHL 27's light grid)?
+static void LogGridWrite(const Image& image, const char* site) {
+	static const bool enabled = std::getenv("KYTY_CHECK_GRID_UPLOADS") != nullptr;
+	if (!enabled || image.backing.format != vk::Format::eR32G32Uint) {
+		return;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 2000) {
+		const auto& dispatch = GpuGetCurrentDispatch();
+		std::printf("grid write %s 0x%016" PRIx64 " %ux%u cpu_dirty=%d buffer_modified=%d "
+		            "by shader=0x%016" PRIx64 " groups=%u,%u,%u%s\n",
+		            site, image.info.data.address, image.info.extent.width,
+		            image.info.extent.height, image.IsCpuDirty() ? 1 : 0,
+		            image.IsBufferModified() ? 1 : 0, dispatch.shader_hash, dispatch.groups[0],
+		            dispatch.groups[1], dispatch.groups[2], dispatch.indirect ? " (indirect)" : "");
+	}
+}
+
+// KYTY_CHECK_GRID_UPLOADS=1: GPU writes through a non-R32G32_UINT image that overlaps an
+// R32G32_UINT one (an alias the grid would not see). Logged once per (address, format, size).
+void TextureCache::LogAliasWrite(ImageId id, const Image& image, const char* site) {
+	static const bool enabled = std::getenv("KYTY_CHECK_GRID_UPLOADS") != nullptr;
+	if (!enabled || image.backing.format == vk::Format::eR32G32Uint) {
+		return;
+	}
+	for (const auto other_id:
+	     FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+		if (other_id == id) {
+			continue;
+		}
+		const auto& other = m_slot_images[other_id];
+		if (other.backing.format != vk::Format::eR32G32Uint) {
+			continue;
+		}
+		static std::mutex                                     mutex;
+		static std::set<std::tuple<uint64_t, int, uint64_t>> seen;
+		std::scoped_lock lock(mutex);
+		if (!seen.emplace(image.info.data.address, static_cast<int>(image.backing.format),
+		                  image.info.data.size)
+		         .second) {
+			return;
+		}
+		std::printf("alias write %s 0x%016" PRIx64 "+0x%" PRIx64 " %ux%u format=%d overlaps grid "
+		            "0x%016" PRIx64 "+0x%" PRIx64 " %ux%u\n",
+		            site, image.info.data.address, image.info.data.size, image.info.extent.width,
+		            image.info.extent.height, static_cast<int>(image.backing.format),
+		            other.info.data.address, other.info.data.size, other.info.extent.width,
+		            other.info.extent.height);
+		return;
+	}
+}
+
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
@@ -597,6 +657,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
 	}
 	if (source.IsGpuModified()) {
+		LogGridWrite(destination, "copy-image");
 		destination.MarkGpuModified();
 	}
 	destination.ClearBufferModified();
@@ -792,6 +853,38 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
+	// A new image initialized from guest memory next to (or instead of) a GPU-written cached one
+	// must see that image's data, as guest memory would on the PS5: the texture cache never wrote
+	// it back. NHL 27 moves its per-tile light grid on resolution changes; the new grid was
+	// initialized from stale memory, its untouched tiles held huge counts, and the light pass ran
+	// for seconds (host GPU timeout).
+	static const bool overlap_publish = [] {
+		// Opt-in: publishing every GPU-written overlap (NHL 27 aliases 4K transient targets
+		// constantly) tiles hundreds of large images during boot and stalled it.
+		const char* value = std::getenv("KYTY_OVERLAP_PUBLISH");
+		return value != nullptr && value[0] == '1';
+	}();
+	const auto publish_cached = [&] {
+		if (overlap_publish && cached.SafeToDownload() && !cached.depth_id && CanDownload(cached)) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 400) {
+				std::printf("overlap publish cached=0x%016" PRIx64 "+0x%" PRIx64
+				            " %ux%u format=%d rt=%d tiled=%d requested=0x%016" PRIx64 "+0x%" PRIx64
+				            " %ux%u\n",
+				            cached.info.data.address, cached.info.data.size,
+				            cached.info.extent.width, cached.info.extent.height,
+				            static_cast<int>(cached.backing.format),
+				            cached.usage.render_target ? 1 : 0, cached.info.IsTiled() ? 1 : 0,
+				            requested.data.address, requested.data.size, requested.extent.width,
+				            requested.extent.height);
+				std::fflush(stdout);
+			}
+		}
+		if (overlap_publish && cached.SafeToDownload() && !cached.depth_id &&
+		    BcAlias::Publish(*this, cached)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureOverlapPublishes);
+		}
+	};
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
@@ -816,6 +909,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
 			                        left.surface_z == right.surface_z;
 		                 }))) {
+			publish_cached();
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}
@@ -860,6 +954,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.type != cached.info.type) {
+			publish_cached();
 			return {merged_id};
 		}
 		if (requested.pixel_format != cached.info.pixel_format ||
@@ -900,6 +995,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id);
 		return {merged_id};
 	}
+	publish_cached();
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
 		FreeImage(cached_id);
 	}
@@ -1007,6 +1103,47 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 }
 
+// KYTY_CHECK_GRID_UPLOADS=1: NHL 27's light-tile pass loops over a per-tile {count, offset}
+// R32G32_UINT image that the game writes on the CPU. Logs uploads whose source bytes hold
+// implausible values (either half > 65535), with the CPU-dirty / GPU-written state.
+static void CheckUploadedGrid(const Image& image) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CHECK_GRID_UPLOADS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled || image.backing.format != vk::Format::eR32G32Uint) {
+		return;
+	}
+	const auto address = image.info.data.address;
+	const auto size    = std::min<uint64_t>(image.info.data.size, 16u << 20u);
+	std::vector<uint32_t> words(size / 4u);
+	if (words.size() < 2 ||
+	    !Libs::LibKernel::Memory::TryReadBufferBacking(address, words.data(), words.size() * 4u)) {
+		return;
+	}
+	uint32_t max0 = 0, max1 = 0;
+	uint64_t big0 = 0, big1 = 0, nonzero = 0;
+	for (size_t i = 0; i + 1 < words.size(); i += 2) {
+		max0 = std::max(max0, words[i]);
+		max1 = std::max(max1, words[i + 1]);
+		big0 += words[i] > 65535u ? 1 : 0;
+		big1 += words[i + 1] > 65535u ? 1 : 0;
+		nonzero += (words[i] | words[i + 1]) != 0 ? 1 : 0;
+	}
+	static std::atomic<uint32_t> logged {0};
+	const bool suspicious = big0 != 0 && big1 != 0;
+	if (suspicious || logged.load() < 20) {
+		if (logged.fetch_add(1) < 400) {
+			std::printf("grid upload 0x%016" PRIx64 " %ux%u: elements=%zu nonzero=%" PRIu64
+			            " max=(%u, %u) >65535=(%" PRIu64 ", %" PRIu64 ") cpu_dirty=%d gpu_buffer=%d%s\n",
+			            address, image.info.extent.width, image.info.extent.height,
+			            words.size() / 2, nonzero, max0, max1, big0, big1,
+			            image.IsCpuDirty() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+			            suspicious ? " SUSPICIOUS" : "");
+		}
+	}
+}
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	TrackImage(id);
@@ -1020,11 +1157,41 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	if (upload && Common::DebugCounters::Enabled()) {
+		// Buffer-modified: GPU buffer writes (compute/copies) to the image's memory.
+		const bool gpu = image.IsBufferModified();
+		Common::DebugCounters::Add(gpu ? Common::DebugCounters::Counter::TextureUploadsGpu
+		                               : Common::DebugCounters::Counter::TextureUploadsCpu);
+		Common::DebugCounters::Add(gpu ? Common::DebugCounters::Counter::TextureUploadGpuBytes
+		                               : Common::DebugCounters::Counter::TextureUploadCpuBytes,
+		                           image.info.data.size);
+	}
 	if (upload) {
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
+		}
+		GpuCheckpointSetUploadReason((image.IsBufferModified() ? 1u : 0u) |
+		                             (image.IsCpuDirty() ? 2u : 0u));
+		CheckUploadedGrid(image);
+		if (image.backing.format == vk::Format::eR32G32Uint && std::getenv("KYTY_CHECK_GRID_UPLOADS")) {
+			std::printf("  uploaded image: gpu_modified=%d render_target=%d tiled=%d size=0x%" PRIx64 "\n",
+			            image.IsGpuModified() ? 1 : 0, image.usage.render_target ? 1 : 0,
+			            image.info.IsTiled() ? 1 : 0, image.info.data.size);
+			for (const auto other_id:
+			     FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+				if (other_id == id) {
+					continue;
+				}
+				const auto& other = m_slot_images[other_id];
+				std::printf("  overlapping image 0x%016" PRIx64 " %ux%u format=%d gpu_modified=%d "
+				            "render_target=%d cpu_dirty=%d size=0x%" PRIx64 "\n",
+				            other.info.data.address, other.info.extent.width,
+				            other.info.extent.height, static_cast<int>(other.backing.format),
+				            other.IsGpuModified() ? 1 : 0, other.usage.render_target ? 1 : 0,
+				            other.IsCpuDirty() ? 1 : 0, other.info.data.size);
+			}
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
@@ -1446,6 +1613,8 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 	}
 	if (desc.type == BindingType::Storage) {
+		LogGridWrite(image, "storage");
+		LogAliasWrite(id, image, "storage");
 		image.MarkGpuModified();
 	}
 	RefreshImage(id);
@@ -1482,6 +1651,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
+	LogAliasWrite(id, image, "render-target");
 	image.MarkGpuModified();
 	image.usage.render_target = true;
 	RefreshImage(id);
@@ -1520,6 +1690,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
+		metadata->second.owner = id;
+		metadata->second.size  = desc.info.metadata.range.size;
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1545,6 +1717,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 }
 
 void TextureCache::CommitGpuWrite(Image& image) {
+	LogGridWrite(image, "commit");
 	if (!image.depth_id && image.backing.image == nullptr) {
 		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
 	}
@@ -1677,6 +1850,13 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
 	}
+	// Guest levels beyond the host's full mip chain do not exist on the host image.
+	if (native_range.baseMipLevel >= image.backing.mip_levels) {
+		CommitGpuWrite(image);
+		return;
+	}
+	native_range.levelCount =
+	    std::min(native_range.levelCount, image.backing.mip_levels - native_range.baseMipLevel);
 	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
 		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                                 &clear.color, 1, &native_range);
@@ -1857,6 +2037,8 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	}
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	// A GPU write to these buffer bytes that the side-queue readback must wait for.
+	m_write_ticks.Assign(image.info.data.address, copy_size, m_scheduler.CurrentTick());
 	return true;
 }
 
@@ -1920,12 +2102,66 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	}
 }
 
+void TextureCache::PreserveGpuImagesForCpuWrite(uint64_t address, uint64_t size) {
+	// A CPU write to memory holding a GPU-written image marks the image CPU-dirty, and its next
+	// use re-uploads it from guest memory. That memory does not hold the GPU's result (the image
+	// was never downloaded), so the upload replaced valid GPU data with stale bytes: NHL 27's
+	// per-tile light-count image then made the light pass loop ~4e9 times and the host GPU time
+	// out. As with buffer write faults, write the GPU data back first, synchronously, so the
+	// CPU write lands on top of it.
+	if (!GuestRange {address, size}.Valid()) {
+		return;
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		bool             any = false;
+		for (const auto id: FindImagesInRegion(address, size, true)) {
+			auto& image = m_slot_images[id];
+			if (!image.depth_id && image.SafeToDownload() && CanDownload(image)) {
+				any = true;
+				break;
+			}
+		}
+		if (!any) {
+			return;
+		}
+	}
+	m_scheduler.Context().GetGpu().SendCommandSync([this, address, size] {
+		bool downloaded = false;
+		{
+			std::scoped_lock lock {m_lock};
+			for (const auto id: FindImagesInRegion(address, size, true)) {
+				if (DownloadImageMemory(id)) {
+					downloaded = true;
+					Common::DebugCounters::Add(
+					    Common::DebugCounters::Counter::TextureWriteFaultDownloads);
+				}
+			}
+		}
+		if (downloaded) {
+			const auto tick = m_scheduler.CurrentTick();
+			m_scheduler.Wait(tick);
+			m_scheduler.WaitPriorityOperations(tick);
+		}
+	});
+}
+
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& owner = m_slot_images[id];
 		if (owner.Overlaps(address, size)) {
+			static const bool log_grid = std::getenv("KYTY_CHECK_GRID_UPLOADS") != nullptr;
+			if (log_grid && owner.backing.format == vk::Format::eR32G32Uint && !owner.IsCpuDirty()) {
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 500) {
+					std::printf("grid cpu-dirty 0x%016" PRIx64 " by write 0x%016" PRIx64 "+0x%" PRIx64
+					            " gpu_thread=%d gpu_modified=%d\n",
+					            owner.info.data.address, address, size,
+					            GuestGpu::IsGpuThread() ? 1 : 0, owner.IsGpuModified() ? 1 : 0);
+				}
+			}
 			owner.MarkCpuDirty();
 			UntrackImage(id);
 			continue;
@@ -1965,6 +2201,22 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	}
 	found->second.clear_mask.set();
 	return true;
+}
+
+TextureCache::MetaState TextureCache::DescribeMeta(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	MetaState        state;
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return state;
+	}
+	state.found = true;
+	state.size  = found->second.size;
+	if (const auto* owner = m_slot_images.try_get(found->second.owner); owner != nullptr) {
+		state.owner_live    = owner->registered;
+		state.owner_matches = owner->info.metadata.range.address == address;
+	}
+	return state;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

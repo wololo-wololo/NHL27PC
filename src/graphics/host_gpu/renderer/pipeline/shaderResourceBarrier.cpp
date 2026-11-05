@@ -5,6 +5,10 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -87,6 +91,59 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 	barrier.offset              = 0;
 	barrier.size                = VK_WHOLE_SIZE;
 	return barrier;
+}
+
+void LogUnalignedBufferBases(const ShaderStageRuntime& runtime, uint64_t shader_hash) {
+	// Descriptor-bound 32-bit buffer accesses index whole dwords, so a guest base that is not
+	// 4-byte aligned would read/write shifted data (the guest GPU allows unaligned access).
+	// KYTY_LOG_UNALIGNED=1 enables this diagnostic (unaligned access is handled since 2026-11-05).
+	static const bool enabled = std::getenv("KYTY_LOG_UNALIGNED") != nullptr;
+	static std::atomic<uint32_t> logged {0};
+	if (!enabled || !runtime || logged.load(std::memory_order_relaxed) >= 200) {
+		return;
+	}
+	const auto& program   = runtime.module->info;
+	const auto& resources = *runtime.resources;
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
+		const auto& value = resources.buffers[i];
+		if (value.dword_count < 4) {
+			continue;
+		}
+		ShaderBufferResource descriptor;
+		std::memcpy(descriptor.fields, value.dwords.data(), sizeof(descriptor.fields));
+		const auto base = descriptor.Base48();
+		if (base == 0 || (base & 3u) == 0 || descriptor.NumRecords() == 0) {
+			continue;
+		}
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 200) {
+			std::printf("unaligned buffer base: shader=0x%016" PRIx64 " buffer=%u base=0x%016" PRIx64
+			            " records=%u stride=%u written=%d\n",
+			            shader_hash, i, base, descriptor.NumRecords(), descriptor.Stride(),
+			            program.info.buffers[i].written ? 1 : 0);
+		}
+	}
+}
+
+std::pair<uint64_t, uint64_t> FirstBufferBases(const ShaderStageRuntime& runtime) {
+	std::pair<uint64_t, uint64_t> bases {};
+	if (!runtime) {
+		return bases;
+	}
+	const auto& program   = runtime.module->info;
+	const auto& resources = *runtime.resources;
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
+		const auto& value = resources.buffers[i];
+		if (value.dword_count < 4) {
+			continue;
+		}
+		ShaderBufferResource descriptor;
+		std::memcpy(descriptor.fields, value.dwords.data(), sizeof(descriptor.fields));
+		auto& slot = program.info.buffers[i].written ? bases.first : bases.second;
+		if (slot == 0) {
+			slot = descriptor.Base48();
+		}
+	}
+	return bases;
 }
 
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {

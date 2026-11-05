@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/gpuCheckpoints.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -290,6 +291,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, 0,
 	    nullptr, 3, barriers, 0, nullptr);
 	if (clear_target) {
+		GpuCheckpointScope gpu_checkpoint_1(command, __FILE__, __LINE__);
 		command.fillBuffer(target, target_offset, target_capacity, 0);
 		barriers[1].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		barriers[1].dstAccessMask =
@@ -320,6 +322,9 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	    (groups + limits.maxComputeWorkGroupCount[0] - 1u) / limits.maxComputeWorkGroupCount[0]);
 	const uint32_t groups_x = static_cast<uint32_t>((groups + groups_y - 1u) / groups_y);
 	EXIT_NOT_IMPLEMENTED(groups_y > limits.maxComputeWorkGroupCount[1]);
+	// Details: groups x, groups y, source bytes, target bytes.
+	GpuCheckpointScope gpu_checkpoint_2(command, __FILE__, __LINE__, groups_x, groups_y,
+	                                    source_capacity, target_capacity);
 	command.dispatch(groups_x, groups_y, 1);
 
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
@@ -545,6 +550,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			push.target_pitch = static_cast<uint32_t>(layout.target_row_stride);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
+			GpuCheckpointScope gpu_checkpoint_3(command, __FILE__, __LINE__);
 			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
 			row += rows;
 		}
@@ -615,6 +621,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	push.to_host         = to_host;
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
+	GpuCheckpointScope gpu_checkpoint_4(command, __FILE__, __LINE__);
 	command.dispatch((pixels + 63u) / 64u, 1, 1);
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
@@ -679,6 +686,7 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32
 	                  static_cast<uint32_t>(stride / 4), keys, expand};
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
+	GpuCheckpointScope gpu_checkpoint_5(command, __FILE__, __LINE__);
 	command.dispatch(slices, 1, 1);
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;

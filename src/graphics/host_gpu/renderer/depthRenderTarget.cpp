@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuCheckpoints.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -406,6 +407,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		region.dstSubresource = region.srcSubresource;
 		region.extent = write_desc.info.extent;
 	}
+	GpuCheckpointScope gpu_checkpoint_1(command, __FILE__, __LINE__);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                  count, regions.data());

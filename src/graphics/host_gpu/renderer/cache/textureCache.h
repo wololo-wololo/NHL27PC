@@ -68,12 +68,24 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	// Before a CPU write: write GPU-modified images in the range back to guest memory
+	// (synchronously, on the GPU thread). Call without the texture-cache lock held.
+	void               PreserveGpuImagesForCpuWrite(uint64_t address, uint64_t size);
+	// Diagnostics (KYTY_CHECK_GRID_UPLOADS): writes through aliases of R32G32_UINT images.
+	void               LogAliasWrite(ImageId id, const Image& image, const char* site);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	struct MetaState {
+		bool     found         = false;
+		bool     owner_live    = false; // the registering depth image still exists
+		bool     owner_matches = false; // and still uses this metadata address
+		uint64_t size          = 0;     // registered metadata range size
+	};
+	[[nodiscard]] MetaState DescribeMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -84,6 +96,9 @@ private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		// The depth image that registered this metadata range, and the range size.
+		ImageId  owner;
+		uint64_t size = 0;
 	};
 
 	struct OverlapResult {

@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/gpuCheckpoints.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -13,7 +15,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <xxhash.h>
 
@@ -158,8 +163,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
-				if (subresource_state.layout != destination_layout ||
-				    subresource_state.access_mask != destination_access || repeated_write) {
+				// Guest levels beyond the host chain have no host subresource to transition.
+				if (level < backing.mip_levels &&
+				    (subresource_state.layout != destination_layout ||
+				     subresource_state.access_mask != destination_access || repeated_write)) {
 					vk::ImageMemoryBarrier2 barrier {};
 					barrier.srcStageMask                    = subresource_state.pl_stage;
 					barrier.srcAccessMask                   = subresource_state.access_mask;
@@ -248,9 +255,34 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	command_buffer.pipelineBarrier2(dependency);
 }
 
-void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
-                   uint64_t size) {
-	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+// Drops regions for guest levels beyond the host image's full mip chain (see the constructor).
+static std::span<const vk::BufferImageCopy> HostLevelCopies(
+    std::span<const vk::BufferImageCopy> copies, uint32_t host_levels,
+    std::vector<vk::BufferImageCopy>& storage) {
+	if (std::ranges::all_of(copies, [&](const vk::BufferImageCopy& copy) {
+		    return copy.imageSubresource.mipLevel < host_levels;
+	    })) {
+		return copies;
+	}
+	storage.clear();
+	for (const auto& copy: copies) {
+		if (copy.imageSubresource.mipLevel < host_levels) {
+			storage.push_back(copy);
+		} else {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::ImageCopiesMipSkipped);
+		}
+	}
+	return storage;
+}
+
+void Image::Upload(std::span<const vk::BufferImageCopy> all_copies, vk::Buffer buffer,
+                   uint64_t offset, uint64_t size) {
+	std::vector<vk::BufferImageCopy> storage;
+	const auto copies = HostLevelCopies(all_copies, backing.mip_levels, storage);
+	EXIT_IF(all_copies.empty() || buffer == nullptr || size == 0);
+	if (copies.empty()) {
+		return;
+	}
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
@@ -273,8 +305,29 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
 	command.pipelineBarrier2(dependency);
+	// Details: width, height, guest address, (layers << 40 | mips << 32 | format).
+	GpuCheckpointScope gpu_checkpoint_1(
+	    command, __FILE__, __LINE__, backing.extent.width, backing.extent.height,
+	    info.data.address,
+	    (uint64_t {GpuCheckpointTakeUploadReason()} << 56u) |
+	        (uint64_t {backing.layers} << 40u) | (uint64_t {backing.mip_levels} << 32u) |
+	        static_cast<uint32_t>(backing.format));
 	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
+	// KYTY_CHECK_GRID_UPLOADS=1 with the indirect-args log: sample the linear upload source of
+	// R32G32_UINT images (NHL 27's per-tile light {count, offset} grid) into the device-loss-safe
+	// ring, so the report shows what the GPU actually uploaded.
+	static const bool sample_grid = std::getenv("KYTY_CHECK_GRID_UPLOADS") != nullptr;
+	if (sample_grid && backing.format == vk::Format::eR32G32Uint && GpuIndirectArgsLogEnabled() &&
+	    size >= 256) {
+		for (uint64_t part = 1; part < 8; part += 2) {
+			const auto            at = (size * part / 8) & ~uint64_t {31};
+			GpuIndirectArgsHostState host {};
+			host.count  = static_cast<uint32_t>(part);
+			host.stride = 0x6a1d; // marks a grid sample in the report
+			GpuLogIndirectArgs(command, buffer, offset + at, info.data.address + at, 32, host);
+		}
+	}
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -287,9 +340,14 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
-void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
+void Image::Download(std::span<const vk::BufferImageCopy> all_copies, vk::Buffer buffer,
                      uint64_t offset, uint64_t size) {
-	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	std::vector<vk::BufferImageCopy> storage;
+	const auto copies = HostLevelCopies(all_copies, backing.mip_levels, storage);
+	EXIT_IF(all_copies.empty() || buffer == nullptr || size == 0);
+	if (copies.empty()) {
+		return;
+	}
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
@@ -313,6 +371,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
 	command.pipelineBarrier2(dependency);
+	GpuCheckpointScope gpu_checkpoint_2(command, __FILE__, __LINE__);
 	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
@@ -398,6 +457,7 @@ void Image::CopyImage(Image& source) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	GpuCheckpointScope gpu_checkpoint_3(command, __FILE__, __LINE__);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
 	                  copies.data());
@@ -449,6 +509,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
+		GpuCheckpointScope gpu_checkpoint_4(command, __FILE__, __LINE__);
 		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 		                  vk::ImageLayout::eTransferDstOptimal, region);
 	} else {
@@ -459,6 +520,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
+		GpuCheckpointScope gpu_checkpoint_5(command, __FILE__, __LINE__);
 		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region);
 	}
@@ -549,6 +611,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
 				command.pipelineBarrier2(dependency);
+				GpuCheckpointScope gpu_checkpoint_6(command, __FILE__, __LINE__);
 				command.copyImageToBuffer(source.backing.image,
 				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
 				                          source_copy);
@@ -565,6 +628,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 					barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
 					command.pipelineBarrier2(dependency);
 				}
+				GpuCheckpointScope gpu_checkpoint_7(command, __FILE__, __LINE__);
 				command.copyBufferToImage(buffer.Handle(), backing.image,
 				                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
 			}
@@ -601,6 +665,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
+	GpuCheckpointScope gpu_checkpoint_8(command, __FILE__, __LINE__);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
 	Transit(vk::ImageLayout::eGeneral,
@@ -716,7 +781,23 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.flags         = ImageCreateFlags(graphics, info, create.usage);
 	create.imageType     = HostImageType(info.type);
 	create.extent        = info.extent;
-	create.mipLevels     = info.resources.levels;
+	// The guest may declare more levels than the full chain (AMD clamps extra levels to 1x1);
+	// Vulkan does not allow that (VUID-VkImageCreateInfo-mipLevels-00958). The host image
+	// keeps the full chain only; copies, views and barriers skip the extra 1x1 levels.
+	const uint32_t largest    = std::max({info.extent.width, info.extent.height,
+	                                      info.type == Prospero::ImageType::kColor3D ? info.extent.depth : 1u});
+	const uint32_t full_chain = static_cast<uint32_t>(std::bit_width(largest));
+	create.mipLevels     = std::min(info.resources.levels, full_chain);
+	if (create.mipLevels != info.resources.levels) {
+		static std::atomic<uint32_t> reported {0};
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::ImagesMipClamped);
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 10) {
+			std::printf("image mip levels clamped: %ux%ux%u format=%d levels %u -> %u\n",
+			            info.extent.width, info.extent.height, info.extent.depth,
+			            static_cast<int>(info.pixel_format), info.resources.levels, create.mipLevels);
+			std::fflush(stdout);
+		}
+	}
 	create.arrayLayers   = info.IsVolume() ? 1u : info.resources.layers;
 	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;

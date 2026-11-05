@@ -1,12 +1,16 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <atomic>
+#include <chrono>
 
 namespace Libs::Graphics {
 
@@ -59,15 +63,37 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
+	using Clock = std::chrono::steady_clock;
+	const bool profile = Common::DebugCounters::Enabled();
+	auto stamp = profile ? Clock::now() : Clock::time_point {};
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	auto record = [&](Common::DebugCounters::Counter counter) {
+		if (!profile) {
+			return;
+		}
+		const auto now = Clock::now();
+		Common::DebugCounters::Add(
+		    counter, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                       now - stamp)
+		                                       .count()));
+		stamp = now;
+	};
+	record(Common::DebugCounters::Counter::GpuFaultMappedNs);
 	if (access == PageFaultAccess::Write) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaultWrites);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		record(Common::DebugCounters::Counter::GpuFaultBufferNs);
+		m_texture_cache.PreserveGpuImagesForCpuWrite(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		record(Common::DebugCounters::Counter::GpuFaultTextureNs);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
+		record(Common::DebugCounters::Counter::GpuFaultImageHeapNs);
 	} else {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaultReads);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		record(Common::DebugCounters::Counter::GpuFaultBufferNs);
 	}
 	return true;
 }
@@ -77,6 +103,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
+	m_texture_cache.PreserveGpuImagesForCpuWrite(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	m_image_heap.InvalidateMemory(vaddr, size);
 	return true;
@@ -190,6 +217,15 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 		}
 	}
 
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::InterruptsDelivered);
+	if (registrations.empty()) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::InterruptsUnregistered);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("GPU interrupt event=%d context=0x%x has no registered event queue\n",
+			            event_id, context_id);
+		}
+	}
 	for (const auto& registration: registrations) {
 		const auto result = LibKernel::EventQueue::KernelTriggerEvent(
 		    registration.eq, static_cast<uintptr_t>(registration.event_id),

@@ -24,6 +24,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -273,14 +274,17 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 	const auto revision = call_source->revision;
 	ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
 	resource_plan.source_reads = call_source->reads;
+	materialize_memo.Invalidate();
 	return revision != call_source->revision;
 }
 
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor) {
+	Common::DebugCounters::StageSequence stages(Common::DebugCounters::Counter::ProgramMaterializeNs);
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
+	                                                    specialization, materialize_memo));
+	stages.Next(Common::DebugCounters::Counter::ProgramMatchNs);
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -319,6 +323,18 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
+	if (ShaderRecompiler::TargetedDumpRequested(key.hash)) {
+		spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_3);
+		std::string          text;
+		disassembler.Disassemble(result.spirv, &text,
+		                         static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES) |
+		                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT));
+		const auto name = fmt::format("shader-{:016x}-{}-{:016x}.spvasm", key.hash, stage, id);
+		if (std::FILE* out = std::fopen(name.c_str(), "w")) {
+			std::fwrite(text.data(), 1, text.size(), out);
+			std::fclose(out);
+		}
+	}
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
@@ -385,11 +401,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		runtime.workgroup_counts   = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ProgramLookups);
+	std::optional<Common::DebugCounters::StageTimer> key_stage(std::in_place, Common::DebugCounters::Counter::ProgramKeyNs);
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
 	auto entry = m_program_cache.find(m_lookup_key);
+	key_stage.reset();
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
 		module.info.bindings.AdvancePushData(push_data_cursor);
@@ -412,7 +431,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
-	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+	                  ShaderRecompiler::TargetedDumpRequested(params.hash);
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
@@ -453,6 +473,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    program.resource_plan, runtime, program.resources, program.specialization));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		entry->second.materialize_memo.Invalidate();
 		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
 			return bind(*module);
 		}

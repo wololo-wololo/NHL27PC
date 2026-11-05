@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/gpuCheckpoints.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -866,11 +867,16 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
+	Common::DebugCounters::ScopedTimer timer(
+	    Common::DebugCounters::Counter::DrawStatePrepCalls,
+	    Common::DebugCounters::Counter::DrawStatePrepNs);
+	Common::DebugCounters::StageSequence prep_stages(Common::DebugCounters::Counter::DrawProgramsNs);
 	m_context.GetImageHeap().BeginDraw();
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	prep_stages.Next(Common::DebugCounters::Counter::DrawTargetsNs);
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
@@ -1070,6 +1076,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 		               {}, command);
 		destination.Transit(vk::ImageLayout::eTransferDstOptimal,
 		                    vk::AccessFlagBits2::eTransferWrite, {}, command);
+		GpuCheckpointScope gpu_checkpoint_1(command, __FILE__, __LINE__);
 		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                  1, &region);
@@ -1081,6 +1088,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          const DrawEmitInfo&          emit,
                                          const DrawIndexBufferSource& index_source) {
+	Common::DebugCounters::ScopedTimer timer(
+	    Common::DebugCounters::Counter::DrawExecuteCalls,
+	    Common::DebugCounters::Counter::DrawExecuteNs);
 	auto&      ucfg                     = buffer.GetUserConfig();
 	const bool primitive_restart_enable = state.primitive_restart_enable;
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
@@ -1131,6 +1141,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	// Stage names: bindings resolve, vertex/index acquire, pipeline lookup, render targets,
+	// descriptor commit and the remaining recording.
+	Common::DebugCounters::StageSequence draw_stages(Common::DebugCounters::Counter::DrawFindBuffersNs);
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1144,7 +1157,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	// The draw's CPU-data buffer uploads share one barrier pair (flushed before anything else
+	// is recorded, at the latest when this scope ends).
+	std::optional<BufferCache::UploadBatchScope> upload_batch;
+	upload_batch.emplace(m_context.GetBufferCache());
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	draw_stages.Next(Common::DebugCounters::Counter::DrawBuffersNs);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1153,17 +1171,31 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
+	GpuIndirectArgsHostState     args_host {};
 	if (emit.indirect.address != 0) {
 		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
 		                  (draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
 		                                    : sizeof(vk::DrawIndirectCommand));
+		if (GpuIndirectArgsLogEnabled()) {
+			// What the emulator believes about the record before it binds it.
+			auto& cache         = m_context.GetBufferCache();
+			args_host.gpu_dirty = cache.IsRegionGpuModified(emit.indirect.address, 20);
+			args_host.cpu_dirty = cache.IsRegionCpuModified(emit.indirect.address, 20);
+			args_host.backing_valid = Libs::LibKernel::Memory::TryReadBufferBacking(
+			    emit.indirect.address, args_host.backing, sizeof(args_host.backing));
+			args_host.count  = emit.indirect.count;
+			args_host.stride = emit.indirect.stride;
+		}
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
+	upload_batch.reset();
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	draw_stages.Next(Common::DebugCounters::Counter::DrawPipelineNs);
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	draw_stages.Next(Common::DebugCounters::Counter::DrawImagesNs);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1189,6 +1221,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
+	draw_stages.Next(Common::DebugCounters::Counter::DrawCommitNs);
+	static const bool draw_args_filtered = std::getenv("KYTY_LOG_INDIRECT_ONLY") != nullptr;
+	if (args_buffer.first != nullptr && GpuIndirectArgsLogEnabled() && !draw_args_filtered) {
+		m_context.GetCommandScheduler().EndRendering();
+		GpuLogIndirectArgs(buffer.Handle(), args_buffer.first->Handle(), args_buffer.second,
+		                   emit.indirect.address,
+		                   draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
+		                                    : sizeof(vk::DrawIndirectCommand),
+		                   args_host);
+	}
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
@@ -1234,17 +1276,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
+	draw_stages.Next(Common::DebugCounters::Counter::DrawRecordNs);
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
+		LogUnalignedBufferBases(stage.stage, stage.stage.module->info.shader_hash);
 		if (HasShaderBufferWrites(stage.stage)) {
 			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
 		}
+	}
+	if (state.ps_active) {
+		LogUnalignedBufferBases(state.ps_input_info.stage, state.ps_input_info.stage.module->info.shader_hash);
 	}
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
 	if (shader_write_stages) {
 		// As for dispatches, buffer writes wait for earlier accesses to the memory.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawWriteHazards);
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
@@ -1259,6 +1307,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	// Checkpoint records carry the first color target (an R32G32_UINT one if bound), so a
+	// device-loss report can show which draws render into an image.
+	uint64_t target_address = 0;
+	if (GpuCheckpointsEnabled()) {
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& info = state.color_info[i].desc.info;
+			if (target_address == 0 || info.pixel_format == vk::Format::eR32G32Uint) {
+				target_address = info.data.address;
+			}
+		}
+	}
+	const auto    checkpoint        = GpuCheckpointBegin(
+        vk_buffer, GpuCheckpointOp::Draw,
+        state.ps_active ? state.ps_input_info.stage.module->info.shader_hash
+                        : state.vertex_info[0].stage.module->info.shader_hash,
+        draw.index_count, draw.instance_count, 0, emit.indirect.address, target_address);
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
@@ -1271,6 +1335,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                       emit.indirect.count, emit.indirect.stride);
+	}
+	GpuCheckpointEnd(vk_buffer, checkpoint);
+	if (buffer.RawHandle() != vk_buffer) {
+		ReportRetiredRecording("draw", state.ps_active
+		                                   ? state.ps_input_info.stage.module->info.shader_hash
+		                                   : state.vertex_info[0].stage.module->info.shader_hash);
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
@@ -1326,6 +1396,9 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	Common::DebugCounters::ScopedTimer timer(
+	    Common::DebugCounters::Counter::DrawProcessCalls,
+	    Common::DebugCounters::Counter::DrawProcessNs);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1433,6 +1506,9 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	Common::DebugCounters::ScopedTimer timer(
+	    Common::DebugCounters::Counter::DrawProcessCalls,
+	    Common::DebugCounters::Counter::DrawProcessNs);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);

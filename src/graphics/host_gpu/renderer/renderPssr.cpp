@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/gpuCheckpoints.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
 #include "graphics/guest_gpu/pssr.h"
@@ -175,6 +176,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pssr_pipeline);
 	command.pushConstants(m_pssr_pipeline_layout, vk::ShaderStageFlagBits::eCompute,
 	                      0, sizeof(parameters), &parameters);
+	GpuCheckpointScope gpu_checkpoint_1(command, __FILE__, __LINE__);
 	command.dispatch((parameters.output_size[0] + 7) / 8,
 	                 (parameters.output_size[1] + 7) / 8, 1);
 	ShaderAccessBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
