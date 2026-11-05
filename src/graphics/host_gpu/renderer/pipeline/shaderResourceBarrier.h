@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_SHADERRESOURCEBARRIER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_SHADERRESOURCEBARRIER_H_
 
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -19,10 +20,10 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
 std::pair<uint64_t, uint64_t> FirstBufferBases(const ShaderStageRuntime& runtime);
 // Logs (first 200) bound buffers whose guest base is not 4-byte aligned.
 void LogUnalignedBufferBases(const ShaderStageRuntime& runtime, uint64_t shader_hash);
-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
-void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+void ShaderAccessBarrier(CmdRef vk_buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteHazardBarrier(CmdRef      vk_buffer,
                               vk::PipelineStageFlags destination_stages);
-void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteBarrier(CmdRef vk_buffer, vk::PipelineStageFlags source_stages);
 
 } // namespace Libs::Graphics
 

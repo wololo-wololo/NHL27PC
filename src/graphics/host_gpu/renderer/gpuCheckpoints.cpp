@@ -244,7 +244,7 @@ bool GpuCheckpointsEnabled() {
 	return g_enabled.load(std::memory_order_relaxed);
 }
 
-uint64_t GpuCheckpointBegin(vk::CommandBuffer command, GpuCheckpointOp op, uint64_t shader_hash,
+uint64_t GpuCheckpointBegin(CmdRef command, GpuCheckpointOp op, uint64_t shader_hash,
                             uint32_t arg0, uint32_t arg1, uint32_t arg2, uint64_t address,
                             uint64_t address2, bool async_compute) {
 	GpuProfileBegin(command, op, shader_hash, arg0, arg1);
@@ -279,7 +279,7 @@ uint64_t GpuCheckpointBegin(vk::CommandBuffer command, GpuCheckpointOp op, uint6
 	return sequence;
 }
 
-void GpuCheckpointEnd(vk::CommandBuffer command, uint64_t sequence) {
+void GpuCheckpointEnd(CmdRef command, uint64_t sequence) {
 	GpuProfileEnd(command);
 	if (sequence == 0 || !GpuCheckpointsEnabled()) {
 		return;
@@ -356,7 +356,7 @@ bool GpuIndirectArgsLogEnabled() {
 	return enabled && GpuCheckpointsEnabled();
 }
 
-void GpuLogIndirectArgs(vk::CommandBuffer command, vk::Buffer source, uint64_t offset,
+void GpuLogIndirectArgs(CmdRef command, vk::Buffer source, uint64_t offset,
                         uint64_t guest_address, uint32_t bytes,
                         const GpuIndirectArgsHostState& host) {
 	if (!GpuIndirectArgsLogEnabled()) {
@@ -390,7 +390,7 @@ void GpuLogIndirectArgs(vk::CommandBuffer command, vk::Buffer source, uint64_t o
 	meta.bytes         = bytes;
 	meta.host          = host;
 	meta.source_offset = offset;
-	meta.host.command  = reinterpret_cast<uint64_t>(static_cast<VkCommandBuffer>(command));
+	meta.host.command  = command.Id();
 	if (index < 40) {
 		std::printf("indirect args log #%" PRIu64 " id=0x%08x cb=0x%" PRIx64 " tick=%" PRIu64
 		            " before record #%" PRIu64 "\n",

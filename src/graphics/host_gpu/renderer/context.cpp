@@ -22,10 +22,10 @@ CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
 bool CommandBuffer::IsInvalid() const {
-	return m_buffer == nullptr;
+	return m_recorder != nullptr ? !m_open : m_buffer == nullptr;
 }
 
-vk::CommandBuffer CommandBuffer::Handle() const {
+CmdRef CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
 	RunRecordHook();
 	m_handle_calls++;
@@ -33,7 +33,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 		FlushComputeBarrier();
 		m_other_work = true;
 	}
-	return m_buffer;
+	return RawHandle();
 }
 
 void CommandBuffer::FlushComputeBarrier() const {
@@ -42,14 +42,17 @@ void CommandBuffer::FlushComputeBarrier() const {
 	}
 	EXIT_IF(m_rendering);
 	m_compute_barrier_pending = false;
-	ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	ShaderAccessBarrier(RawHandle(), vk::PipelineStageFlagBits::eComputeShader);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::CsBarriersFlushed);
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid() || m_compute_barrier_pending);
 	m_other_work = true;
-	auto buffer  = m_buffer;
+	if (m_recorder != nullptr) {
+		return; // the recorder's worker begins the Vulkan buffer
+	}
+	auto buffer = m_buffer;
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -62,8 +65,11 @@ void CommandBuffer::Begin() {
 void CommandBuffer::End() const {
 	EndRendering();
 	auto buffer = Handle();
+	if (buffer.IsAsync()) {
+		return; // the recorder's worker ends the Vulkan buffer before submitting it
+	}
 
-	auto result = buffer.end();
+	auto result = buffer.Native().end();
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }

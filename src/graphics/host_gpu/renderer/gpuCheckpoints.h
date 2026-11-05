@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUCHECKPOINTS_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUCHECKPOINTS_H_
 
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
@@ -30,23 +31,23 @@ void               InitGpuCheckpoints(GraphicContext& graphics);
 [[nodiscard]] bool GpuCheckpointsEnabled();
 
 // Returns the record's sequence number, for the matching end checkpoint.
-uint64_t GpuCheckpointBegin(vk::CommandBuffer command, GpuCheckpointOp op, uint64_t shader_hash,
+uint64_t GpuCheckpointBegin(CmdRef command, GpuCheckpointOp op, uint64_t shader_hash,
                             uint32_t arg0 = 0, uint32_t arg1 = 0, uint32_t arg2 = 0,
                             uint64_t address = 0, uint64_t address2 = 0,
                             bool async_compute = false);
-void     GpuCheckpointEnd(vk::CommandBuffer command, uint64_t sequence);
+void     GpuCheckpointEnd(CmdRef command, uint64_t sequence);
 
 // Marks the emulator's own GPU work (copies, clears, internal dispatches) until the scope ends;
 // the report names its source line.
 class GpuCheckpointScope {
 public:
-	GpuCheckpointScope(vk::CommandBuffer command, const char* file, int line)
+	GpuCheckpointScope(CmdRef command, const char* file, int line)
 	    : m_command(command),
 	      m_sequence(GpuCheckpointBegin(command, GpuCheckpointOp::Copy,
 	                                    reinterpret_cast<uint64_t>(file),
 	                                    static_cast<uint32_t>(line))) {}
 	// With details printed in the device-loss report (e.g. sizes and addresses).
-	GpuCheckpointScope(vk::CommandBuffer command, const char* file, int line, uint32_t detail0,
+	GpuCheckpointScope(CmdRef command, const char* file, int line, uint32_t detail0,
 	                   uint32_t detail1, uint64_t detail2, uint64_t detail3)
 	    : m_command(command),
 	      m_sequence(GpuCheckpointBegin(command, GpuCheckpointOp::Copy,
@@ -58,7 +59,7 @@ public:
 	GpuCheckpointScope& operator=(const GpuCheckpointScope&) = delete;
 
 private:
-	vk::CommandBuffer m_command;
+	CmdRef m_command;
 	uint64_t          m_sequence;
 };
 
@@ -77,7 +78,7 @@ struct GpuIndirectArgsHostState {
 	uint64_t tick          = 0;
 	uint64_t command       = 0;
 };
-void GpuLogIndirectArgs(vk::CommandBuffer command, vk::Buffer source, uint64_t offset,
+void GpuLogIndirectArgs(CmdRef command, vk::Buffer source, uint64_t offset,
                         uint64_t guest_address, uint32_t bytes,
                         const GpuIndirectArgsHostState& host);
 

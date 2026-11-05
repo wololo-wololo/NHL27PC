@@ -68,12 +68,12 @@ size_t CommandScheduler::CommandPool::Grow() {
 	return first;
 }
 
-vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
+vk::CommandBuffer CommandScheduler::CommandPool::Commit(uint64_t tick) {
 	auto       gpu_tick = m_master.KnownGpuTick();
-	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
+	const auto search   = [this, &gpu_tick, tick](size_t begin, size_t end) -> std::optional<size_t> {
 		for (size_t index = begin; index < end; ++index) {
 			if (gpu_tick >= m_ticks[index]) {
-				m_ticks[index] = m_master.CurrentTick();
+				m_ticks[index] = tick;
 				return index;
 			}
 		}
@@ -91,7 +91,7 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 	}
 	if (!found) {
 		found           = Grow();
-		m_ticks[*found] = m_master.CurrentTick();
+		m_ticks[*found] = tick;
 	}
 
 	m_hint = (*found + 1) % m_ticks.size();
@@ -102,10 +102,30 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
+                                   bool allow_async)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	// KYTY_ASYNC_RECORD=1: record Vulkan commands on a worker thread (see CommandRecorder).
+	static const bool async = [] {
+		const char* value = std::getenv("KYTY_ASYNC_RECORD");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (allow_async && async) {
+		m_recorder = std::make_unique<CommandRecorder>(
+		    [this](uint64_t tick) {
+			    const auto buffer = m_command_pool.Commit(tick);
+			    vk::CommandBufferBeginInfo begin_info {};
+			    begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+			    EXIT_NOT_IMPLEMENTED(buffer.begin(&begin_info) != vk::Result::eSuccess);
+			    return buffer;
+		    },
+		    [this] { return CurrentTick(); });
+		m_command.m_recorder = m_recorder.get();
+		std::printf("GPU: asynchronous command recording enabled\n");
+	}
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -131,9 +151,9 @@ void CommandScheduler::BeginGpuTiming() {
 		                     "vkCreateQueryPool");
 	}
 	m_timestamp_query = (m_timestamp_slot++ % GPU_TIMING_SLOTS) * 2u;
-	m_command.m_buffer.resetQueryPool(m_timestamps, m_timestamp_query, 2);
-	m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, m_timestamps,
-	                                  m_timestamp_query);
+	m_command.RawHandle().resetQueryPool(m_timestamps, m_timestamp_query, 2u);
+	m_command.RawHandle().writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, m_timestamps,
+	                                     m_timestamp_query);
 }
 
 void CommandScheduler::EndGpuTiming() {
@@ -142,8 +162,8 @@ void CommandScheduler::EndGpuTiming() {
 	}
 	const auto query   = m_timestamp_query;
 	m_timestamp_query  = UINT32_MAX;
-	m_command.m_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_timestamps,
-	                                  query + 1u);
+	m_command.RawHandle().writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_timestamps,
+	                                     query + 1u);
 	// Submissions also happen without a bound context, which DeferOperation requires.
 	std::lock_guard lock(m_operation_mutex);
 	if (m_operation_state != OperationState::Open) {
@@ -402,10 +422,19 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
-	m_command.m_buffer = m_command_pool.Commit();
+	if (m_recorder != nullptr) {
+		m_command.m_open  = true;
+		m_command.m_epoch = CurrentTick();
+		m_command.Begin();
+		BeginGpuTiming();
+		GpuProfileBeginCommandBuffer(*this, m_command.RawHandle());
+		m_dynamic_state.Invalidate();
+		return m_command;
+	}
+	m_command.m_buffer = m_command_pool.Commit(CurrentTick());
 	m_command.Begin();
 	BeginGpuTiming();
-	GpuProfileBeginCommandBuffer(*this, m_command.m_buffer);
+	GpuProfileBeginCommandBuffer(*this, m_command.RawHandle());
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
@@ -435,7 +464,54 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_command.RunRecordHook();
 	m_command.FlushComputeBarrier();
 	EndGpuTiming();
-	GpuProfileEndCommandBuffer(m_command.m_buffer, CurrentTick());
+	if (m_recorder != nullptr) {
+		GpuProfileEndCommandBuffer(m_command.RawHandle(), CurrentTick());
+		m_command.End();
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+		// Ticks are assigned in recording order and the worker submits in the same order.
+		const auto tick = m_master.NextTick();
+		submit.AddSignal(m_master.Handle(), tick);
+		struct Debug {
+			uint32_t op;
+			uint64_t submit_id;
+			uint32_t arg0, arg1, arg2, arg3;
+			uint64_t arg4;
+		} debug {m_command.m_debug_op,   m_command.m_debug_submit_id, m_command.m_debug_arg0,
+		         m_command.m_debug_arg1, m_command.m_debug_arg2,      m_command.m_debug_arg3,
+		         m_command.m_debug_arg4};
+		m_recorder->Submit([this, submit, tick, debug](vk::CommandBuffer buffer) {
+			EXIT_NOT_IMPLEMENTED(buffer.end() != vk::Result::eSuccess);
+			auto& graphics = m_graphics;
+			vk::Result result;
+			{
+				Common::LockGuard lock(graphics.queue_mutex);
+				vk::TimelineSemaphoreSubmitInfo timeline_info {};
+				timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+				timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+				timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+				timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+				vk::SubmitInfo submit_info {};
+				submit_info.pNext                = &timeline_info;
+				submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+				submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+				submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+				submit_info.commandBufferCount   = 1;
+				submit_info.pCommandBuffers      = &buffer;
+				submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+				submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+				result = graphics.queue.submit(1, &submit_info, nullptr);
+			}
+			if (result != vk::Result::eSuccess) {
+				ReportGpuCheckpoints(graphics);
+				ReportVulkanFatal("vkQueueSubmit", result, tick, debug.op, debug.submit_id,
+				                  debug.arg0, debug.arg1, debug.arg2, debug.arg3, debug.arg4);
+			}
+			EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		});
+		m_command.m_open = false;
+		return tick;
+	}
+	GpuProfileEndCommandBuffer(m_command.RawHandle(), CurrentTick());
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

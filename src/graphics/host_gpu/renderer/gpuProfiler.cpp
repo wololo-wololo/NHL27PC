@@ -68,7 +68,7 @@ struct Profiler {
 	vk::QueryPool                                   pool     = nullptr;
 	double                                          period   = 1.0;
 	std::vector<uint32_t>                           free_chunks;
-	std::unordered_map<VkCommandBuffer, Chunk>      active;
+	std::unordered_map<uint64_t, Chunk>             active;
 	std::deque<Chunk>                               pending;
 	std::unordered_map<uint64_t, Stats>             stats;
 	std::vector<uint64_t>                           scratch;
@@ -274,8 +274,8 @@ void Collect(Profiler& p) {
 	}
 }
 
-Chunk* Find(Profiler& p, vk::CommandBuffer command) {
-	auto it = p.active.find(static_cast<VkCommandBuffer>(command));
+Chunk* Find(Profiler& p, CmdRef command) {
+	auto it = p.active.find(command.Id());
 	return it == p.active.end() ? nullptr : &it->second;
 }
 
@@ -287,7 +287,7 @@ bool GpuProfileEnabled() {
 	return p.enabled.load(std::memory_order_relaxed);
 }
 
-void GpuProfileBeginCommandBuffer(CommandScheduler& scheduler, vk::CommandBuffer command) {
+void GpuProfileBeginCommandBuffer(CommandScheduler& scheduler, CmdRef command) {
 	if (!GpuProfileEnabled()) {
 		return;
 	}
@@ -320,16 +320,16 @@ void GpuProfileBeginCommandBuffer(CommandScheduler& scheduler, vk::CommandBuffer
 	chunk.next      = chunk.first + 2;
 	command.resetQueryPool(p.pool, chunk.first, CHUNK_QUERIES);
 	command.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, p.pool, chunk.first);
-	p.active[static_cast<VkCommandBuffer>(command)] = std::move(chunk);
+	p.active[command.Id()] = std::move(chunk);
 }
 
-void GpuProfileEndCommandBuffer(vk::CommandBuffer command, uint64_t tick) {
+void GpuProfileEndCommandBuffer(CmdRef command, uint64_t tick) {
 	if (!GpuProfileEnabled()) {
 		return;
 	}
 	auto& p = P();
 	std::scoped_lock lock(p.mutex);
-	auto it = p.active.find(static_cast<VkCommandBuffer>(command));
+	auto it = p.active.find(command.Id());
 	if (it == p.active.end()) {
 		return;
 	}
@@ -343,7 +343,7 @@ void GpuProfileEndCommandBuffer(vk::CommandBuffer command, uint64_t tick) {
 	p.active.erase(it);
 }
 
-void GpuProfileBegin(vk::CommandBuffer command, GpuCheckpointOp op, uint64_t key, uint32_t arg0,
+void GpuProfileBegin(CmdRef command, GpuCheckpointOp op, uint64_t key, uint32_t arg0,
                      uint32_t arg1) {
 	if (!GpuProfileEnabled()) {
 		return;
@@ -438,7 +438,7 @@ void GpuTracePacket(uint32_t opcode, const uint32_t* packet, uint32_t size_dw) {
 	std::printf("\n");
 }
 
-void GpuProfileEnd(vk::CommandBuffer command) {
+void GpuProfileEnd(CmdRef command) {
 	if (!GpuProfileEnabled()) {
 		return;
 	}

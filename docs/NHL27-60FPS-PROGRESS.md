@@ -153,6 +153,33 @@ Last updated: 2026-11-05 (Europe/Berlin)
     allocate/free ~2%, `memmove` ~2%, materialization ~2%.
   - The structural options: an async Vulkan recording thread (driver and emulator record code,
     ~20% of the thread), or GPU-side descriptor resolution.
+- **Async Vulkan command recording (built, opt-in `KYTY_ASYNC_RECORD=1`, off by default).**
+  - `CommandBuffer::Handle()` now returns a `CmdRef` (`commandRecorder.h`) instead of a
+    `vk::CommandBuffer`. Without a recorder it calls Vulkan directly (immediate mode; the
+    presenter's scheduler always is).
+  - With a recorder, each command is a closure in a 16 KiB chunk arena; pointer arguments
+    (barriers, regions, descriptor writes, rendering info, push constants) are deep-copied.
+  - A worker thread replays the chunks into the pooled `VkCommandBuffer`, then ends and submits
+    it with the tick the GPU thread assigned. Chunks are recycled per submitted buffer.
+    `CmdRef::Raw(fn)` is the escape hatch for raw calls; the profiler keys on `CmdRef::Id()`.
+  - It works: gameplay renders correctly and runs stably. On the GPU thread the driver share
+    (`vkGetInstanceProcAddr`) fell 10.8% → 0.9%, and per-draw record+commit 1.06 → 0.5 µs.
+  - **But no FPS gain** (`async2..5` vs `memo2`/`imm-*`: 18–21 vs 20–22 FPS). GPU-thread waits
+    rose from ~4% to ~11%.
+    - Every synchronous `Wait(CurrentTick)` now also covers the worker's replay and submit
+      latency.
+    - Texture write-back downloads before CPU writes (`PreserveGpuImagesForCpuWrite`, a full
+      drain each) jumped 1.4 → 17–48/s: images otherwise downloaded in the background once
+      their tick completes are still GPU-owned when the CPU writes, since ticks now complete
+      later.
+  - Wait attribution (`KYTY_WAIT_STACKS=<s>`, GPU-thread stacks of sampled blocking waits):
+    38/60 are such write-back waits run via `GuestGpu::ProcessCommands`; 18/60 are buffer
+    readbacks from faults.
+  - Conclusion: async recording only pays once the synchronous drains are gone. Next: make the
+    image write-back wait only for the image's producer (side queue, like buffer readbacks), or
+    avoid it. Then re-measure with `KYTY_ASYNC_RECORD=1`.
+  - Default path verified after the `CmdRef` change: `imm-1/2`, 21.6 / 20.6 FPS, 0/2 device
+    losses.
 - **Where it stood earlier (`tsc2`, ~19 FPS, a heavier scene):** GPU busy ~610 ms/s (~32 ms per
   frame); PM4 thread ~914 ms/s, draws ~9.3 µs each.
   - Both CPU and GPU must shrink ~35% for a stable 30.

@@ -4,6 +4,13 @@
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/gpuCheckpoints.h"
+#include "common/threadSampler.h"
+
+#include "graphics/guest_gpu/graphicsRun.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -49,6 +56,20 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
+	// KYTY_WAIT_STACKS=<seconds>: from that long after the first blocking wait, print the caller
+	// stack of every 16th blocking wait on the GPU thread (first 60).
+	static const char* wait_env    = std::getenv("KYTY_WAIT_STACKS");
+	if (wait_env != nullptr && GuestGpu::IsGpuThread()) {
+		static const auto start = std::chrono::steady_clock::now() +
+		                          std::chrono::seconds(std::atoi(wait_env));
+		static std::atomic<uint32_t> waits {0};
+		if (std::chrono::steady_clock::now() >= start) {
+			const auto n = waits.fetch_add(1, std::memory_order_relaxed);
+			if (n % 16u == 0u && n / 16u < 60u) {
+				Common::ThreadSampler::PrintCurrentStack("  gpu wait stack");
+			}
+		}
+	}
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;

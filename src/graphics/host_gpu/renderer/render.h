@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -113,10 +114,12 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	[[nodiscard]] vk::CommandBuffer Handle() const;
-	// The current Vulkan buffer without flushing deferred barriers. A submit while a command is
+	[[nodiscard]] CmdRef Handle() const;
+	// The current buffer without flushing deferred barriers. A submit while a command is
 	// being prepared retires the buffer, so a handle read earlier stops being the current one.
-	[[nodiscard]] vk::CommandBuffer RawHandle() const noexcept { return m_buffer; }
+	[[nodiscard]] CmdRef RawHandle() const noexcept {
+		return {m_recorder, m_buffer, m_recorder != nullptr && m_open ? m_epoch : 0};
+	}
 	[[nodiscard]] bool              IsRendering() const noexcept { return m_rendering; }
 	// Incremented by every Handle() call: equal values mean nothing was recorded in between.
 	[[nodiscard]] uint64_t          HandleCalls() const noexcept { return m_handle_calls; }
@@ -176,6 +179,10 @@ private:
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	vk::CommandBuffer   m_buffer          = nullptr;
+	// Async recording: commands go to the recorder; m_open marks a logical buffer (tick m_epoch).
+	CommandRecorder*    m_recorder        = nullptr;
+	bool                m_open            = false;
+	uint64_t            m_epoch           = 0;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
 	uint32_t            m_debug_arg0      = 0;

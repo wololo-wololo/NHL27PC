@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -20,7 +21,8 @@ extern std::atomic<uint32_t> g_submit_probe;
 
 class CommandScheduler {
 public:
-	CommandScheduler(RenderContext& context, GraphicContext& graphics);
+	// allow_async: this scheduler may record through a worker thread (KYTY_ASYNC_RECORD).
+	CommandScheduler(RenderContext& context, GraphicContext& graphics, bool allow_async = false);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -64,7 +66,7 @@ private:
 		~CommandPool();
 		KYTY_CLASS_NO_COPY(CommandPool);
 
-		vk::CommandBuffer Commit();
+		vk::CommandBuffer Commit(uint64_t tick);
 
 	private:
 		static constexpr size_t GrowStep = 4;
@@ -105,6 +107,8 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	// Destroyed before the pool: its worker uses the pool and the queue.
+	std::unique_ptr<CommandRecorder> m_recorder;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
