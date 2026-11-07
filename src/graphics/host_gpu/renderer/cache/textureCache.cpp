@@ -2126,7 +2126,20 @@ void TextureCache::PreserveGpuImagesForCpuWrite(uint64_t address, uint64_t size)
 			return;
 		}
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, address, size] {
+	// KYTY_IMAGE_WRITEBACK_CALLER_WAIT=1 (experimental, unsafe): the GPU thread only records and
+	// submits the downloads and the faulting thread waits for them, so the GPU thread keeps
+	// processing. While it does, it can render into the image again before the caller marks it
+	// CPU-dirty, and the next use then re-uploads stale guest memory over the newer GPU data:
+	// 3 device losses in 5 async-recording runs (hrep-1..5, 2026-11-06). Off by default; the
+	// default drains on the GPU thread, so nothing can touch the image in between.
+	static const bool wait_on_gpu = [] {
+		const char* value = std::getenv("KYTY_IMAGE_WRITEBACK_CALLER_WAIT");
+		return value == nullptr || value[0] != '1';
+	}();
+	const bool caller_waits = !wait_on_gpu && Common::DebugCounters::AbVariant() &&
+	                          !GuestGpu::IsGpuThread();
+	uint64_t wait_tick = 0;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, address, size, caller_waits, &wait_tick] {
 		bool downloaded = false;
 		{
 			std::scoped_lock lock {m_lock};
@@ -2140,10 +2153,19 @@ void TextureCache::PreserveGpuImagesForCpuWrite(uint64_t address, uint64_t size)
 		}
 		if (downloaded) {
 			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
+			if (caller_waits) {
+				m_scheduler.Flush();
+				wait_tick = tick;
+			} else {
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
+			}
 		}
 	});
+	if (wait_tick != 0) {
+		m_scheduler.GetMasterSemaphore().Wait(wait_tick);
+		m_scheduler.WaitPriorityOperations(wait_tick);
+	}
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {

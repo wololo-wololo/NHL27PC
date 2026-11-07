@@ -91,14 +91,16 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	return Graphics::GuestRange {vaddr, size}.Valid();
 }
 
-static void MapGpuRange(uint64_t vaddr, uint64_t size) {
+// mirror: direct (GPU data) memory, which the GPU-memory mirror covers (KYTY_GPU_MIRROR); flexible,
+// PRT and runtime memory stay on the lazy path (flexible memory also holds thread stacks).
+static void MapGpuRange(uint64_t vaddr, uint64_t size, bool mirror = false) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(true, vaddr, size);
 #endif
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
-	GetGpuResources().MapMemory(vaddr, size);
+	GetGpuResources().MapMemory(vaddr, size, mirror);
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -947,6 +949,20 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 		}
 	}
 
+	return false;
+}
+
+// Whether [address, address + size) touches a registered PRT (partially resident) aperture,
+// whose pages may have no backing.
+bool OverlapsPrtAperture(uint64_t address, uint64_t size) {
+	if (size == 0 || UINT64_MAX - address < size) return false;
+	Common::LockGuard lock(g_prt_aperture_mutex);
+	for (const auto& aperture: g_prt_apertures) {
+		if (aperture.size != 0 && address < aperture.address + aperture.size &&
+		    aperture.address < address + size) {
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -2456,7 +2472,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			}
 			EXIT_IF(!g_physical_memory->Map(old.start, old.offset, old.size));
 		}
-		MapGpuRange(in_addr, len);
+		MapGpuRange(in_addr, len, true);
 	};
 	if (fixed) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1u)) != 0 ||
@@ -2595,7 +2611,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_EBUSY;
 	}
 
-	MapGpuRange(out_addr, len);
+	MapGpuRange(out_addr, len, true);
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
@@ -3627,7 +3643,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 		return KERNEL_ERROR_EBUSY;
 	}
 
-	MapGpuRange(vaddr, len);
+	MapGpuRange(vaddr, len, true);
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(vaddr, len);

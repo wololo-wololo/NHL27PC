@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 
@@ -117,10 +118,25 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
-void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
+void RenderContext::MapMemory(uint64_t vaddr, uint64_t size, bool mirror) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
-	m_buffer_cache.QueueBdaSync(vaddr, size);
+	if (mirror && (BufferCache::MirrorEnabled() || BufferCache::HostMirrorEnabled())) {
+		m_buffer_cache.QueueMirror(vaddr, size);
+	}
+	{
+		// GPU-visible guest memory, for sizing a full mirror: print each 256 MiB step.
+		static const bool trace = std::getenv("KYTY_GPU_MIRROR_TRACE") != nullptr;
+		static uint64_t total = 0, printed = 0;
+		total += size;
+		if (trace && total / (256u << 20) != printed) {
+			printed = total / (256u << 20);
+			std::printf("GPU-visible guest memory mapped: %.2f GiB (last 0x%llx +0x%llx)\n",
+			            static_cast<double>(total) / (1u << 30), static_cast<unsigned long long>(vaddr),
+			            static_cast<unsigned long long>(size));
+		}
+	}
+	m_buffer_cache.QueueBdaSyncCpu(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -132,6 +148,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
+		const bool priority =
+		    m_command_scheduler.Active() && m_command_scheduler.HasPendingPriorityOperations();
 		if (m_command_scheduler.Active() &&
 		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
 		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
@@ -141,6 +159,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
+		if (BufferCache::MirrorEnabled() || BufferCache::HostMirrorEnabled()) {
+			m_buffer_cache.UnmapMirror(vaddr, size);
+		}
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
@@ -155,15 +176,43 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+void RenderContext::PrepareBdaForSubmission() {
+	if (!BufferCache::MirrorEnabled() && !BufferCache::BdaSliceSyncEnabled()) {
+		return;
+	}
+	m_bda_submission_sync = true;
+	PrepareBda();
+	m_bda_submission_sync = false;
+}
+
 void RenderContext::PrepareBda() {
+	if (BufferCache::MirrorEnabled() && !m_bda_submission_sync) {
+		m_fault_process_pending = true;
+		return;
+	}
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	m_buffer_cache.ApplyMirror();
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_buffer_cache.TakeBdaSync().ForEach([this](uint64_t begin, uint64_t end) {
+	// Per DMA draw only buffers registered since the last sync; CPU writes are synced at the start
+	// of each submission slice (BufferCache::QueueBdaSyncCpu), unless slice sync is off.
+	const bool all = m_bda_submission_sync || BufferCache::MirrorEnabled() ||
+	                 !BufferCache::BdaSliceSyncEnabled();
+	m_buffer_cache.TakeBdaSync(all).ForEach([this](uint64_t begin, uint64_t end) {
 		m_mapped_ranges.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
+			static const bool trace = std::getenv("KYTY_GPU_MIRROR_TRACE") != nullptr;
+			if (trace && finish - start >= (1u << 20)) {
+				std::printf("BDA sync: 0x%llx +0x%llx\n", static_cast<unsigned long long>(start),
+				            static_cast<unsigned long long>(finish - start));
+				std::fflush(stdout);
+			}
 			m_buffer_cache.SynchronizeBuffersInRange(start, finish - start);
+			if (trace && finish - start >= (1u << 20)) {
+				std::printf("BDA sync done\n");
+				std::fflush(stdout);
+			}
 		});
 	});
 	m_fault_process_pending = true;

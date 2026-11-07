@@ -89,6 +89,14 @@ uint32_t SrtWalkerLoadLength(uint64_t rip);
 // becomes unknown (both successors reachable) instead of being read. 0 for any other load.
 uint32_t SrtWalkerUnknownSkip(uint64_t rip);
 
+// Walks on a helper thread (asynchronous materialization) must not touch the buffer cache: a
+// faulting walker load there only marks the walk aborted (the GPU thread redoes it).
+void SetSrtWalkerHelperThread(bool helper);
+// On a helper thread: if rip is a walker load, marks the walk aborted and returns its length.
+uint32_t SrtWalkerHelperAbort(uint64_t rip);
+// Whether a walker load faulted on this helper thread since the last call; clears the flag.
+bool TakeSrtWalkerHelperAborted();
+
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
 template <size_t Size>

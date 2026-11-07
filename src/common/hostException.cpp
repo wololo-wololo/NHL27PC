@@ -1,3 +1,4 @@
+#include "common/threadSampler.h"
 #include "common/hostException.h"
 
 #include <atomic>
@@ -292,6 +293,18 @@ bool InstallHandler(Handler handler) {
 	g_handler.store(handler, std::memory_order_release);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Last chance: exceptions no handler took (they would end the process silently) print
+	// their code, address and stack first.
+	SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* pointers) -> LONG {
+		const auto* record = pointers->ExceptionRecord;
+		std::printf("--- Unhandled exception 0x%08lx at %p (info %llx %llx) ---\n",
+		            record->ExceptionCode, record->ExceptionAddress,
+		            record->NumberParameters > 0 ? static_cast<unsigned long long>(record->ExceptionInformation[0]) : 0ull,
+		            record->NumberParameters > 1 ? static_cast<unsigned long long>(record->ExceptionInformation[1]) : 0ull);
+		Common::ThreadSampler::PrintContextStack(pointers->ContextRecord, "faulting stack");
+		std::fflush(stdout);
+		return EXCEPTION_CONTINUE_SEARCH;
+	});
 	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);

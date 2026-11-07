@@ -1040,8 +1040,15 @@ struct SystemOverlay::Impl {
 	void FinishSplash() {
 		g_splash_active.store(false, std::memory_order_release);
 		if (splash_dds[0] || splash_dds[1]) {
-			Common::LockGuard lock(graphics.queue_mutex);
-			RequireVulkanSuccess(graphics.queue.waitIdle(), "retire splash images");
+			{
+				Common::LockGuard lock(graphics.queue_mutex);
+				RequireVulkanSuccess(graphics.queue.waitIdle(), "retire splash images");
+			}
+			// The presenter draws them, on its own queue.
+			if (graphics.present_queue != nullptr) {
+				Common::LockGuard lock(graphics.present_queue_mutex);
+				RequireVulkanSuccess(graphics.present_queue.waitIdle(), "retire splash images");
+			}
 			splash_dds = {};
 		}
 	}

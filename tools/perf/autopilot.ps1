@@ -101,6 +101,8 @@ function Test-Gameplay {
     foreach ($line in $lines) {
         $d = 0; $f = 0
         if ($line -match '\bDraws=(\d+)') { $d = [int]$Matches[1] }
+        # Draws dropped by the KYTY_SKIP_DRAWS diagnostic still mean the arena is being rendered.
+        if ($line -match '\bSkippedDraws=(\d+)') { $d += [int]$Matches[1] }
         if ($line -match '\bFlipsRequested=(\d+)') { $f = [int]$Matches[1] }
         if ($f -lt 3 -or $d / $f -lt 1500) { return $false }
     }

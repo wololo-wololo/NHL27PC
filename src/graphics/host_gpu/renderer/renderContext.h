@@ -56,9 +56,13 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
-	void               MapMemory(uint64_t vaddr, uint64_t size);
+	void               MapMemory(uint64_t vaddr, uint64_t size, bool mirror = false);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// With the GPU-memory mirror: CPU writes reach the mirror once per guest submission slice
+	// (the guest cannot change data for a submitted command buffer) instead of before every
+	// DMA draw, which re-armed write protection ~2,800 times per frame.
+	void               PrepareBdaForSubmission();
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -89,6 +93,7 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	bool                      m_bda_submission_sync = false;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

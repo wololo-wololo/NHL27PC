@@ -137,6 +137,7 @@ void FaultManager::ProcessFaultBuffer() {
 		const auto  count  = static_cast<uint32_t>(faults[0]);
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
+			if (m_buffer_cache.SkipHostMirrorPromotion(address)) continue;
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
 		}

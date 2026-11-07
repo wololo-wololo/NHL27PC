@@ -13,6 +13,8 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <type_traits>

@@ -1,9 +1,11 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <type_traits>
@@ -94,6 +96,50 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+// Loop watchdog. NHL 27's device losses were shaders looping on garbage counts read from memory
+// (a light-tile count, an indirect instance count, an adjacency-list length of ~1e9), which run
+// for seconds until Windows resets the GPU. Every invocation gets one iteration budget shared by
+// all its loops; a loop header that already branches to its merge block leaves the loop once
+// the budget is spent. Real loops in the game stay far below it; a garbage-bounded one then ends
+// in well under the 2 s TDR limit, costing a wrong result instead of the device.
+// Opt-in (KYTY_LOOP_WATCHDOG=1; needs a cleared _PipelineCache, like other codegen switches): with
+// it, cold NVIDIA compiles of NHL 27 compute pipelines took 1-8+ s each (wdog*, warm-* runs on
+// 2026-11-06), long enough for the game's own GPU watchdog to core-dump on every cold start.
+constexpr uint32_t LoopWatchdogBudget = 1u << 22u;
+thread_local uint32_t t_loop_watchdog_variable = 0;
+// Merge blocks of the loops of the function being emitted. In structured SPIR-V the only edges
+// into a loop's merge block are that loop's exits (header, latch or a break).
+thread_local std::unordered_set<const IR::Block*> t_loop_merges;
+
+bool LoopWatchdogEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LOOP_WATCHDOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// Counts one loop iteration (every loop header); returns the new count.
+uint32_t EmitLoopWatchdogTick(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, t_loop_watchdog_variable);
+	const auto next = EmitAddU32(state, count, ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpStore, t_loop_watchdog_variable, next);
+	return next;
+}
+
+// "Budget spent" for a count (0: load the current one).
+uint32_t EmitLoopWatchdogExpired(EmitterState& state, uint32_t count) {
+	if (count == 0) {
+		count = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, t_loop_watchdog_variable);
+	}
+	const auto expired = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), expired, count,
+	                          ConstantU32(state, LoopWatchdogBudget));
+	return expired;
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
@@ -111,6 +157,14 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 		}
 	};
 
+	// Every iteration of a loop passes its header: count it there (before the merge instruction,
+	// which must directly precede the branch).
+	const bool watchdog   = t_loop_watchdog_variable != 0;
+	uint32_t   tick_count = 0;
+	if (watchdog && term.loop_header &&
+	    (term.kind == CFG::TerminatorKind::Branch || term.kind == CFG::TerminatorKind::ConditionalBranch)) {
+		tick_count = EmitLoopWatchdogTick(ctx.state);
+	}
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch: {
 			const auto* target = term.true_block;
@@ -129,7 +183,29 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto condition = ctx.Def(block->condition);
+			// A branch with an edge to a loop's merge block (a loop exit) takes that edge once the
+			// budget is spent. The exit block's phis already have this incoming edge.
+			const bool       true_exit  = t_loop_merges.contains(true_block);
+			const bool       false_exit = t_loop_merges.contains(false_block);
+			const IR::Block* exit       = true_exit != false_exit ? (true_exit ? true_block : false_block)
+			                                                      : nullptr;
+			if (exit != nullptr && watchdog) {
+				auto&      state   = ctx.state;
+				const auto expired = EmitLoopWatchdogExpired(state, tick_count);
+				const auto guarded = state.builder.AllocateId();
+				if (true_block == exit) {
+					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), guarded, condition,
+					                          expired);
+				} else {
+					const auto alive = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), alive, expired);
+					state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), guarded, condition,
+					                          alive);
+				}
+				condition = guarded;
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::LoopWatchdogsEmitted);
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -336,6 +412,15 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	t_loop_merges.clear();
+	uint32_t loops = 0;
+	for (const auto* block: program.blocks) {
+		const auto& term = block->terminator;
+		if (!term.loop_header) continue;
+		loops++;
+		if (term.merge_block != nullptr) t_loop_merges.insert(term.merge_block);
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::LoopWatchdogLoops, loops);
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
@@ -728,6 +813,15 @@ void EmitProgram(EmitterState& state) {
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
 	}
+	t_loop_watchdog_variable = 0;
+	if (LoopWatchdogEnabled() && !state.program.dispatcher_fallback &&
+	    std::ranges::any_of(program.blocks,
+	                        [](const IR::Block* block) { return block->terminator.loop_header; })) {
+		t_loop_watchdog_variable = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          t_loop_watchdog_variable, spv::StorageClassFunction);
+	}
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
@@ -736,6 +830,9 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (t_loop_watchdog_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, t_loop_watchdog_variable, ConstantU32(state, 0));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);

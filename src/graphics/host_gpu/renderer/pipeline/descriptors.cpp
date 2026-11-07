@@ -34,6 +34,8 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <limits>
 #include <span>

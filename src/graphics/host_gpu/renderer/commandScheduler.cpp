@@ -103,14 +103,16 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 }
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
-                                   bool allow_async)
-    : m_master(graphics), m_context(context), m_graphics(graphics),
+                                   bool allow_async, bool present)
+    : m_master(graphics), m_context(context), m_graphics(graphics), m_present(present),
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
-	// KYTY_ASYNC_RECORD=1: record Vulkan commands on a worker thread (see CommandRecorder).
+	// Vulkan commands are recorded on a worker thread (see CommandRecorder); KYTY_ASYNC_RECORD=0
+	// records them on the calling thread. Default since 2026-11-06 night: asst-1..5 vs imst-1..5
+	// (same build, 150 s of gameplay each) 27.3 vs 25.2 flips/s, 0/5 device losses in both.
 	static const bool async = [] {
 		const char* value = std::getenv("KYTY_ASYNC_RECORD");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	if (allow_async && async) {
 		m_recorder = std::make_unique<CommandRecorder>(
@@ -349,6 +351,15 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 	return !m_priority_operations.empty() || m_priority_active;
 }
 
+uint64_t CommandScheduler::LatestPendingPriorityTick() {
+	std::lock_guard lock(m_operation_mutex);
+	uint64_t tick = m_priority_active ? m_priority_active_tick : 0;
+	if (!m_priority_operations.empty()) {
+		tick = std::max(tick, m_priority_operations.back().tick);
+	}
+	return tick;
+}
+
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
@@ -387,6 +398,10 @@ void CommandScheduler::DrainPriorityOperations() {
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
+	std::optional<Common::DebugCounters::StageTimer> gpu_thread_timer;
+	if (Common::DebugCounters::Enabled() && GuestGpu::IsGpuThread()) {
+		gpu_thread_timer.emplace(Common::DebugCounters::Counter::GpuThreadSyncWaitNs);
+	}
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
 		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
@@ -507,6 +522,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 				                  debug.arg0, debug.arg1, debug.arg2, debug.arg3, debug.arg4);
 			}
 			EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+			m_master.MarkSubmitted(tick);
 		});
 		m_command.m_open = false;
 		return tick;
@@ -523,7 +539,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	    Common::DebugCounters::Counter::QueueSubmits,
 	    Common::DebugCounters::Counter::QueueSubmitNs);
 	{
-		Common::LockGuard lock(graphics.queue_mutex);
+		Common::LockGuard lock(m_present ? graphics.PresentQueueMutex() : graphics.queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
 
@@ -543,7 +559,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result = (m_present ? graphics.PresentQueue() : graphics.queue).submit(1, &submit_info, nullptr);
 	}
 	if (result != vk::Result::eSuccess) {
 		ReportGpuCheckpoints(graphics);
@@ -553,6 +569,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	m_master.MarkSubmitted(tick);
 
 	m_command.m_buffer = nullptr;
 	return tick;

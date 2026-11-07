@@ -1479,27 +1479,31 @@ void DefineGetBdaPointer(EmitterState& state) {
 	                          page);
 	const auto base = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
+	// An entry with bit 0 set points into the host-memory mirror (BufferCache::HostMirrorEnabled):
+	// the page is read there (the CPU's current bytes) and also recorded like a missing page, so
+	// the CPU promotes it to a device buffer. A zero entry records the fault and reads zero.
 	const auto missing = Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
-	const auto fault_label     = state.builder.AllocateId();
-	const auto available_label = state.builder.AllocateId();
-	const auto merge_label     = state.builder.AllocateId();
+	const auto tagged  = Binary(state, spv::OpINotEqual, TypeBool(state),
+	                            Binary(state, spv::OpBitwiseAnd, type, base, ConstantU64(state, 1)),
+	                            ConstantU64(state, 0));
+	const auto record  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), record, missing, tagged);
+	const auto fault_label = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
-	state.builder.AddFunction(spv::OpBranchConditional, missing, fault_label, available_label);
+	state.builder.AddFunction(spv::OpBranchConditional, record, fault_label, merge_label);
 
 	EmitLabel(state, fault_label);
 	RecordBdaFault(state, page);
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
-	EmitLabel(state, available_label);
+	EmitLabel(state, merge_label);
 	const auto offset    = Binary(state, spv::OpBitwiseAnd, type, address,
 	                              ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
-	const auto available = Binary(state, spv::OpIAdd, type, base, offset);
-	state.builder.AddFunction(spv::OpBranch, merge_label);
-
-	EmitLabel(state, merge_label);
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpPhi, type, result, ConstantU64(state, 0), fault_label,
-	                          available, available_label);
+	const auto available = Binary(state, spv::OpIAdd, type,
+	                              Binary(state, spv::OpBitwiseAnd, type, base, ConstantU64(state, ~uint64_t {1})),
+	                              offset);
+	const auto result = Select(state, type, missing, ConstantU64(state, 0), available);
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }

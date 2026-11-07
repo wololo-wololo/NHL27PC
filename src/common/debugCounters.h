@@ -4,6 +4,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <thread>
 #if defined(_MSC_VER) || defined(__clang__) || defined(__GNUC__)
 #include <x86intrin.h>
@@ -77,6 +79,27 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::i
 	X(AgcAcbSubmitNs) \
 	X(GpuWaits) /* CPU blocked on a GPU timeline semaphore. */ \
 	X(GpuWaitNs) \
+	X(GpuThreadWaits) /* The subset of GpuWaits made by the guest GPU (PM4) thread. */ \
+	X(GpuThreadWaitNs) \
+	X(GpuThreadSyncWaitNs) /* GPU thread blocked waiting for priority operations (publishes). */ \
+	X(MaterializeFaultCalls) /* Materializations that raised host exceptions (walker loads). */ \
+	X(MaterializeFaultNs) \
+	X(MaterializeFaultExceptions) \
+	X(MaterializeCleanNs) \
+	X(WalkSrtNs) /* JIT SRT walker runs (inside materialization). */ \
+	X(LoopWatchdogsEmitted) /* Loop headers given the iteration budget (shader compiles). */ \
+	X(MirrorBytes) /* Guest memory added to the GPU mirror (KYTY_GPU_MIRROR). */ \
+	X(AsyncMaterializePosted) /* Pixel-shader materializations posted to the helper. */ \
+	X(AsyncMaterializeUsed) /* ... whose helper result the lookup used. */ \
+	X(AsyncMaterializeAborted) /* ... aborted by a walker fault (redone inline). */ \
+	X(AsyncMaterializeWaitNs) /* GPU thread waiting for the helper. */ \
+	X(LoopWatchdogLoops) /* Structured loops in compiled shaders (guarded or not). */ \
+	X(ImageCreates) /* Host images created (GraphicContext::CreateImage). */ \
+	X(ImageCreateNs) \
+	X(ImageDeletes) \
+	X(SkippedDraws) /* Draws dropped by KYTY_SKIP_DRAWS (diagnostic). */ \
+	X(ImageDeleteNs) \
+	X(GpuThreadReadbackNs) /* Buffer readbacks (ReadMemory sync) made on the GPU thread. */ \
 	X(GpuFaults) /* Guest writes to GPU-tracked memory. */ \
 	X(GpuFaultNs) \
 	X(GpuFaultReads) \
@@ -210,6 +233,9 @@ inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 inline void SetEnabled(bool enabled) noexcept {
 	Detail::g_enabled.store(enabled, std::memory_order_relaxed);
 }
+
+// Host access-violation exceptions handled on the current thread (any kind).
+inline thread_local uint32_t t_host_exceptions = 0;
 
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
 	if (!Enabled()) {

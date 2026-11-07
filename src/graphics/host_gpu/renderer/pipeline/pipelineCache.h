@@ -14,6 +14,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -28,6 +29,8 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+class MaterializeWorker;
 
 struct GraphicContext;
 struct ShaderParams;
@@ -179,6 +182,7 @@ public:
 	              const std::filesystem::path& shader_store = {});
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	// Writes the driver cache now (waits for a background save in progress).
 	void Save();
 
 	struct Pipeline {
@@ -211,13 +215,21 @@ private:
 		std::vector<ShaderModule>                    modules;
 		ShaderRecompiler::IR::MaterializeMemo        materialize_memo;
 		bool                                         skip_dispatch = false;
+		// `resources`/`specialization` already hold this lookup's materialization (done ahead,
+		// on the GPU thread or a helper); the next FindModule only matches.
+		bool                                         materialized_ahead = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                         uint32_t                                push_data_cursor);
+		// Fills `resources`/`specialization` for this lookup (exits when it cannot).
+		void Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime);
 	};
+
+private:
+	friend struct PipelineCacheTestAccess;
 
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -254,6 +266,22 @@ private:
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created; closed without a shader store.
 	ShaderStoreWriter m_store;
+	// Asynchronous materialization (KYTY_ASYNC_MATERIALIZE): the program a helper is
+	// materializing for the current draw, joined before its lookup.
+	friend class MaterializeWorker;
+	std::unique_ptr<MaterializeWorker> m_materialize_worker;
+	Program*                           m_ahead_program = nullptr;
+	ProgramKey                         m_ahead_key;
+
+	// The cached, already compiled program for these inputs whose resources can be materialized
+	// apart from its lookup (no GPU-selected calls), with the runtime its lookup uses.
+	template <typename InputInfo>
+	Program* FindAheadProgram(const ShaderParams& params, InputInfo& input_info,
+	                          ShaderRecompiler::IR::SrtRuntime& runtime);
+	// Materializes now (GPU thread) or posts to the helper; the lookup then only matches.
+	template <typename InputInfo>
+	void MaterializeAhead(const ShaderParams& params, InputInfo& input_info, bool on_helper);
+	void JoinAhead();
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,

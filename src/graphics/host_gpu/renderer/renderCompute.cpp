@@ -45,12 +45,14 @@
 #include <vector>
 
 namespace Libs::Graphics {
-// KYTY_RELAXED_CS_BARRIERS=1 leaves dispatch-to-dispatch ordering to the guest's own
-// synchronization packets instead of a full barrier after every dispatch.
+// Dispatch-to-dispatch ordering is left to the guest's own synchronization packets instead of a
+// full barrier after every dispatch (as on AMD hardware). On by default since 2026-11-06: GPU time
+// per frame 26.3 -> 16.5 ms (gpu1 vs gpurel1), no ice corruption over 320 s of play (rel-long1,
+// the earlier corruption predates later fixes). KYTY_RELAXED_CS_BARRIERS=0 restores the barriers.
 bool RelaxedComputeBarriers() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_RELAXED_CS_BARRIERS");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
 }

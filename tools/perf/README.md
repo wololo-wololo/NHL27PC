@@ -8,6 +8,9 @@ Local helpers from the 2026-11-02 session. Paths are hard-coded for this machine
 | `build.cmd` | Builds `kyty_emulator` with VS 2022 Build Tools, LLVM clang-cl and the bundled glslang on `PATH`, launcher disabled (no Qt). Run from `cmd` or `cmd /c tools\perf\build.cmd`. |
 | `measure.ps1 -Name X [-Seconds N] [-Sample 'delay,dur'] [-Env '$env:VAR=''1'';']` | One measured run: stops any running emulator, stages the build (exe + pdb), runs the optimized preset with `perf-X.log`, closes the game after N seconds. Writes `console-X.log` and, with `-Sample`, `thread-samples-X.txt` in the workspace root. |
 | `measure.ps1 ... -Autopilot` | Same, but drives the menus to Play Now CPU-vs-CPU gameplay first (see below); `-Seconds` then counts gameplay time. Screens seen are saved under `autopilot-shots\<Name>\` in the workspace root. |
+| `measure.ps1 ... -Autopilot -SkipIntro 8` | Taps Cross 8× (1.5 s apart) once the arena renders, skipping the pre-game presentation to the opening faceoff. Every run is also watched by `hangwatch.ps1`; the final line reports `hangwatch: …`. |
+| `hangwatch.ps1 -Name X [-Kill]` | Waits for a PM4 hang in `perf-X.log` (8 idle seconds), then writes all thread stacks with lldb to `hang-threads-X.txt` (UTF-16; read with `iconv -f UTF-16LE`) and, with `-Kill`, closes the emulator. |
+| `hang-repro.ps1 [-Prefix p] [-Runs n] [-Seconds s] [-StopOnHang]` | Repeats autopilot runs with the caller's environment; prints device losses and hangs per run and in total (stability checks). |
 | `autopilot.ps1 [-PerfLog perf.log]` | Boot → sign-in notice (Cross) → main menu, Play Now (Cross) → Select Team (**Triangle** = CPU vs CPU) → team/jersey confirmations (Cross ×4) → Start Game (Cross) → waits for in-arena rendering (10 s at ≥1500 draws/flip). Reacts as soon as each screen appears (~60 s launch → arena with a warm shader cache). `-Identify` names the current screen and saves `peek.png`; `-Record NAME` stores the current prompt bar as reference `NAME` in `nav-refs.txt`. |
 | `hunt-loop.ps1 [-Prefix huntN]` | Device-loss capture loop with the localizing diagnostics (start-only markers, completion every 8th, indirect-args log); stops after 2 captures. |
 | `verify-loop.ps1 [-Prefix fixN] [-Runs 10]` | Default-config runs; prints device losses per run and the total (fix verification). |
@@ -19,6 +22,7 @@ Local helpers from the 2026-11-02 session. Paths are hard-coded for this machine
 | `avg.py LOG START END KEYS…` | Averages counters over a time window (`*Ns` printed as ms/s). |
 | `keys.py LOG START END KEYS…` | Raw per-second values. |
 | `abstat.py LOG START END [KEYS…]` | Compares `ab=0` vs `ab=1` seconds of an in-run A/B (`KYTY_AB_PERIOD`). |
+| `slowfast.py START END SLOW_MAX FAST_MIN LOG…` | Compares counters between slow and fast seconds (by `FlipsRequested`) across logs. |
 | `rbattr.py LOG START END` | Readback time by PM4 opcode (`rbopXX`). |
 | `nsys-capture.ps1` | Nsight Systems CPU sampling + Vulkan trace. Needs an elevated PowerShell (the user approved this). |
 | `gpu_workload.py DB`, `cpu_threads.py DB [N]` | Summaries of an exported Nsight `.sqlite`. |
@@ -35,6 +39,23 @@ Scripted input and screenshots (no window focus needed, works minimized):
 - Screens are recognized by the near-white button-prompt text at the bottom of NHL 27's menus,
   which is static while backgrounds animate. If a game update changes a menu, re-record its
   reference with `autopilot.ps1 -Record <name>` while that screen is shown.
+
+SRT walker (descriptor materialization JIT, `SrtWalker.cpp`):
+
+- `KYTY_WALK_STATS=<s>[,<start s>]`: that long after the first walk, print once the plans with
+  the most walker time (calls, ns/call, warm repeat, repeat rates, flat reads, code bytes); with
+  `<start s>`, walks before that point are not counted (e.g. `95,70` covers the pre-game intro).
+- `KYTY_WALK_DUMP=<bytes>` / `KYTY_WALK_DUMP_HASH=<hex>,…`: node composition of big walkers /
+  of those hashes (the latter also writes `walker-<hash>-<stage>.bin`).
+- `KYTY_WALKER_VERIFY=1`: run a reference walker (no inlining) beside every walk and print
+  mismatches (slow; correctness check after walker changes).
+- `KYTY_WALKER_INLINE_READS=0`, `KYTY_WALKER_PREFETCH=0`: disable the 2026-11-06 walker
+  optimizations; `KYTY_WALKER_FAST_MARKS=0` the 2026-11-07 single-store reachability marks,
+  `KYTY_WALKER_NEST=0` nested single-use thunks, `KYTY_WALKER_PREFETCH_PARTIAL=0` the first-32
+  prefetches of walkers that need more (then none, as before).
+- `KYTY_PRESENT_QUEUE=0`: present on the main queue (default: a separate queue).
+
+
 
 GPU time per shader:
 

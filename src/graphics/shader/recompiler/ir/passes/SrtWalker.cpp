@@ -2,16 +2,30 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
+#include <fmt/format.h>
 #include <xbyak/xbyak.h>
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <array>
+#include <span>
+#include <chrono>
+#include <cstdio>
+#include <unordered_map>
+#include <vector>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <optional>
+#include <set>
+#include <string>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -384,7 +398,9 @@ private:
 // rdx scratch, r8 capture cursor.
 class WalkerCompiler {
 public:
-	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code): m_plan(plan), m_code(code) {}
+	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code, bool allow_inline = true)
+	    : m_plan(plan), m_code(code), m_allow_inline(allow_inline) {}
+	[[nodiscard]] uint32_t ValuesEnd() const { return m_shader_base; }
 
 	void Compile(std::span<const Value> values);
 
@@ -412,14 +428,34 @@ private:
 		// Feeds only block conditions (reachability), never a descriptor, flat read or output:
 		// an unknown value just makes both successors reachable.
 		bool                 condition_only = false;
+		// A leaf address read (no node arguments) used by exactly one root fetch: emitted at that
+		// fetch instead of as a thunk (no state, slot, call or return).
+		bool                 inlined = false;
+		// A value used by exactly one argument fetch of one other thunk's body (never a root):
+		// emitted inline at that fetch (slot, but no state, call or return). The consumer runs
+		// at most once per walk, so the nested body does too, in the same order as a call.
+		bool                 nested = false;
 	};
 
 	static constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
 
 	bool Thunk(uint32_t index) const {
 		const auto& node = m_nodes[index];
-		return node.referenced || node.result == Operand {Kind::Node, index};
+		return !node.inlined && !node.nested &&
+		       (node.referenced || node.result == Operand {Kind::Node, index});
 	}
+	// Thunks and nested values keep their value in a scratch slot.
+	bool HasSlot(uint32_t index) const { return Thunk(index) || m_nodes[index].nested; }
+	// Failure exit of the body being emitted: return from a thunk, or the consumer's unknown
+	// label for a nested body.
+	const Xbyak::Label& Fail() const { return *m_fail; }
+	void MarkInlinedReads(std::span<const Operand> roots);
+	void MarkNestedThunks(std::span<const Operand> roots);
+	void EmitBody(uint32_t index);
+	void EmitPrefetches();
+	void EmitInlineRead(const Node& node, const Xbyak::Label& unknown);
+	// The 48-bit base that r12 holds in the root code, if any (see EmitInlineRead).
+	void ForgetBase() { m_base_valid = false; }
 	static bool MayBeUnknown(const Operand& operand) {
 		return operand.kind == Kind::Unknown || operand.kind == Kind::Node;
 	}
@@ -449,6 +485,61 @@ private:
 	void EmitRead(const Node& node);
 	void EmitStrict(const Node& node);
 
+	// KYTY_WALK_DUMP=<min code bytes>: print the node composition of the first walkers that big.
+	void DumpComposition() const {
+		static const char* env = std::getenv("KYTY_WALK_DUMP");
+		static int dumped = 0;
+		// KYTY_WALK_DUMP_HASH=<hex>[,<hex>]: also those plans, with their code in walker-<hash>.bin.
+		static const char* hashes = std::getenv("KYTY_WALK_DUMP_HASH");
+		const bool by_hash = hashes != nullptr &&
+		                     std::strstr(hashes, fmt::format("{:016x}", m_plan.shader_hash).c_str()) != nullptr;
+		if (!by_hash && (env == nullptr || dumped >= 4 || m_code.getSize() < static_cast<size_t>(std::atoll(env)))) return;
+		if (!by_hash) dumped++;
+		if (by_hash) {
+			const auto name = fmt::format("walker-{:016x}-{}.bin", m_plan.shader_hash, static_cast<uint32_t>(m_plan.stage));
+			if (std::FILE* out = std::fopen(name.c_str(), "wb")) {
+				std::fwrite(m_code.getCode(), 1, m_code.getSize(), out);
+				std::fclose(out);
+			}
+		}
+		std::map<std::string, std::pair<uint32_t, uint32_t>> ops; // name -> nodes, node args
+		std::map<std::vector<std::pair<int, uint64_t>>, uint32_t> read_bases;
+		uint32_t thunks = 0, node_args = 0, reads = 0;
+		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+			if (!Thunk(index)) continue;
+			const auto& node = m_nodes[index];
+			thunks++;
+			uint32_t args = 0;
+			for (const auto& arg: node.args) args += arg.kind == Kind::Node;
+			node_args += args;
+			auto name = node.result != Operand {Kind::Node, index}
+			                ? std::string("(folded)")
+			                : std::string(ValueOpcodeName(node.inst->GetOpcode()));
+			auto& entry = ops[name];
+			entry.first++;
+			entry.second += args;
+			const auto op = node.inst->GetOpcode();
+			if (node.result == Operand {Kind::Node, index} &&
+			    (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+			     op == ValueOpcode::LoadBufferU32)) {
+				reads++;
+				std::vector<std::pair<int, uint64_t>> key;
+				for (size_t a = 0; a < node.args.size(); ++a) {
+					if (a == 2) continue; // the offset operand
+					key.emplace_back(static_cast<int>(node.args[a].kind), node.args[a].value);
+				}
+				read_bases[key]++;
+			}
+		}
+		std::printf("SRT walker composition hash=%016llx stage=%u code=%zu nodes=%zu thunks=%u node_args=%u reads=%u read_bases=%zu outputs=%zu blocks=%zu\n",
+		            static_cast<unsigned long long>(m_plan.shader_hash), static_cast<uint32_t>(m_plan.stage),
+		            m_code.getSize(), m_nodes.size(), thunks, node_args, reads, read_bases.size(),
+		            m_outputs.size(), m_plan.control_flow.size());
+		for (const auto& [name, entry]: ops)
+			std::printf("  op %-28s nodes=%u node_args=%u\n", name.c_str(), entry.first, entry.second);
+		std::fflush(stdout);
+	}
+
 	ResourcePlan&                                     m_plan;
 	Xbyak::CodeGenerator&                             m_code;
 	std::vector<Value>                                m_masks {Value {}};
@@ -457,6 +548,11 @@ private:
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	Xbyak::Label                                      m_ret;
+	const Xbyak::Label*                               m_fail = &m_ret;
+	const Xbyak::Label*                               m_done = nullptr; // set for nested bodies
+	bool     m_allow_inline = true;
+	bool     m_base_valid = false;
+	Operand  m_base_lo, m_base_hi;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 };
@@ -702,7 +798,7 @@ void WalkerCompiler::Layout() {
 	m_shader_base = offset;
 	offset += 8u;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
-		if (!Thunk(index)) continue;
+		if (!HasSlot(index)) continue;
 		m_nodes[index].slot = offset;
 		offset += 8u;
 	}
@@ -752,6 +848,17 @@ void WalkerCompiler::Branch(const Operand& operand, const Xbyak::Label& unknown)
 	auto& c = m_code;
 	if (operand.kind == Kind::Unknown) {
 		c.jmp(unknown, Near);
+	} else if (operand.kind == Kind::Node && m_nodes[operand.value].nested) {
+		// The body in place of `call`: unknown leaves to this fetch's label, a value continues.
+		Xbyak::Label done;
+		const auto*  fail_before = m_fail;
+		const auto*  done_before = m_done;
+		m_fail = &unknown;
+		m_done = &done;
+		EmitBody(static_cast<uint32_t>(operand.value));
+		m_fail = fail_before;
+		m_done = done_before;
+		c.L(done);
 	} else if (operand.kind == Kind::Node) {
 		auto& node = m_nodes[operand.value];
 		c.call(node.label);
@@ -776,8 +883,220 @@ void WalkerCompiler::Load(const Xbyak::Reg64& reg, const Operand& operand) {
 
 // Loads the operand into rax, or jumps to unknown when it has no value at run time.
 void WalkerCompiler::Fetch(const Operand& operand, const Xbyak::Label& unknown) {
+	if (operand.kind == Kind::Node && m_nodes[operand.value].inlined) {
+		EmitInlineRead(m_nodes[operand.value], unknown);
+		return;
+	}
 	Branch(operand, unknown);
 	Load(m_code.rax, operand);
+}
+
+// Counts every use of each node (root fetches and thunk arguments) and marks the leaf address
+// reads used by exactly one root fetch for inlining.
+void WalkerCompiler::MarkInlinedReads(std::span<const Operand> roots) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WALKER_INLINE_READS");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || !m_allow_inline) return;
+	std::vector<uint32_t> root_uses(m_nodes.size(), 0u), arg_uses(m_nodes.size(), 0u);
+	for (const auto& operand: roots) {
+		if (operand.kind == Kind::Node) root_uses[operand.value]++;
+	}
+	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+		const auto& node = m_nodes[index];
+		if (!Thunk(index)) continue;
+		if (node.result.kind == Kind::Node && node.result.value != index) arg_uses[node.result.value]++;
+		for (const auto& arg: node.args) {
+			if (arg.kind == Kind::Node) arg_uses[arg.value]++;
+		}
+	}
+	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+		auto& node = m_nodes[index];
+		if (node.referenced || node.result != Operand {Kind::Node, index} ||
+		    node.inst->GetOpcode() != ValueOpcode::LoadAddressU32 || node.args.size() != 3u ||
+		    root_uses[index] != 1u || arg_uses[index] != 0u) continue;
+		const bool leaf = std::ranges::all_of(node.args, [](const Operand& arg) {
+			return arg.kind == Kind::Constant || arg.kind == Kind::UserData || arg.kind == Kind::ShaderBase;
+		});
+		node.inlined = leaf;
+	}
+}
+
+// KYTY_WALKER_NEST=0 disables (2026-11-07 part 12). Walkers were compute bound (62% of their
+// time remained with hot caches), mostly in thunk calls and state-byte checks. A value whose only
+// use is one argument fetch in another thunk's body is emitted at that fetch instead (see
+// Node::nested). Only bodies that fetch each argument at one place qualify as consumers: not
+// Phis (per-predecessor fetches), not LogicalAnd/LogicalOr (two exclusive fetch sites) and not
+// folded values. Executed reads, captures and their order are those of the lazy walker, which
+// the reference walker (KYTY_WALKER_VERIFY, no nesting) checks.
+void WalkerCompiler::MarkNestedThunks(std::span<const Operand> roots) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WALKER_NEST");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || !m_allow_inline) return;
+	std::vector<uint32_t> root_uses(m_nodes.size(), 0u), arg_uses(m_nodes.size(), 0u);
+	std::vector<uint32_t> consumer(m_nodes.size(), UINT32_MAX);
+	for (const auto& operand: roots) {
+		if (operand.kind == Kind::Node) root_uses[operand.value]++;
+	}
+	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+		if (!Thunk(index)) continue;
+		const auto& node = m_nodes[index];
+		if (node.result != Operand {Kind::Node, index}) {
+			// A folded thunk's body fetches only its result.
+			if (node.result.kind == Kind::Node) arg_uses[node.result.value] += 2u;
+			continue;
+		}
+		const auto op = node.inst->GetOpcode();
+		const bool single_sites =
+		    op != ValueOpcode::Phi && op != ValueOpcode::LogicalAnd && op != ValueOpcode::LogicalOr;
+		for (const auto& arg: node.args) {
+			if (arg.kind != Kind::Node) continue;
+			arg_uses[arg.value] += single_sites ? 1u : 2u;
+			consumer[arg.value] = index;
+		}
+	}
+	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+		auto& node = m_nodes[index];
+		if (!Thunk(index) || node.referenced || node.result != Operand {Kind::Node, index} ||
+		    node.inst->GetOpcode() == ValueOpcode::Phi || root_uses[index] != 0u ||
+		    arg_uses[index] != 1u || consumer[index] == UINT32_MAX || consumer[index] == index) {
+			continue;
+		}
+		node.nested = true;
+	}
+}
+
+// Guest descriptor tables are usually just written by game threads on other cores, so each
+// read misses the cache; one after another they took about half of the walk. Every leaf address
+// read (arguments from user data and constants only) can be addressed at entry, so the walk
+// starts by prefetching each distinct cache line they touch and the misses overlap. Prefetches
+// never fault, also on unmapped or protected pages; lines of reads the walk then skips are only
+// wasted bandwidth. KYTY_WALKER_PREFETCH=0 disables it.
+void WalkerCompiler::EmitPrefetches() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WALKER_PREFETCH");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled) return;
+	auto& c = m_code;
+	struct Group {
+		Operand            lo, hi;
+		std::set<int64_t>  lines;
+	};
+	std::vector<Group> groups;
+	size_t             total = 0;
+	constexpr size_t   MaxPrefetches = 256;
+	for (uint32_t index = 0; index < m_nodes.size() && total < MaxPrefetches; ++index) {
+		const auto& node = m_nodes[index];
+		if (!(node.inlined || HasSlot(index)) || node.result != Operand {Kind::Node, index} ||
+		    node.inst->GetOpcode() != ValueOpcode::LoadAddressU32 || node.args.size() != 3u ||
+		    node.args[2].kind != Kind::Constant) continue;
+		const bool leaf = std::ranges::all_of(node.args, [](const Operand& arg) {
+			return arg.kind == Kind::Constant || arg.kind == Kind::UserData || arg.kind == Kind::ShaderBase;
+		});
+		if (!leaf) continue;
+		const auto offset =
+		    (static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[node.inst->Flags<MemoryFlags>().index].offset)) &
+		     ~int64_t {3}) +
+		    static_cast<int64_t>(static_cast<uint32_t>(node.args[2].value) & ~3u);
+		if (offset < INT32_MIN || offset > INT32_MAX) continue;
+		auto group = std::ranges::find_if(groups, [&](const Group& g) {
+			return g.lo == node.args[0] && g.hi == node.args[1];
+		});
+		if (group == groups.end()) {
+			groups.push_back({node.args[0], node.args[1], {}});
+			group = std::prev(groups.end());
+		}
+		if (group->lines.insert(offset).second) total++;
+	}
+	// The base is not line-aligned, so lines are not known here. Prefetch an offset 32 or more
+	// bytes past the last one prefetched, and the last offset: prefetched addresses are then
+	// under 64 bytes apart within every run of reads, so each line read holds one of them.
+	std::vector<std::vector<int64_t>> points(groups.size());
+	size_t                            emitted = 0;
+	for (size_t g = 0; g < groups.size(); ++g) {
+		const std::vector<int64_t> offsets(groups[g].lines.begin(), groups[g].lines.end());
+		int64_t last = INT64_MIN;
+		for (size_t i = 0; i < offsets.size(); ++i) {
+			const bool final = i + 1u == offsets.size();
+			if (last != INT64_MIN && offsets[i] - last < 32 && !final) continue;
+			points[g].push_back(offsets[i]);
+			last = offsets[i];
+		}
+		emitted += points[g].size();
+	}
+	// Large walkers (big pixel-shader tables, mostly gated by reachability) got slower with
+	// their prefetches (up to 256, many to lines the walk skips): only small sets pay off.
+	// Bigger sets get their first MaxEmitted points (KYTY_WALKER_PREFETCH_PARTIAL=0: none, the
+	// 2026-11-06 behavior); a 128-block vertex walker spent ~25% of its walk in misses without any.
+	constexpr size_t MaxEmitted = 32;
+	static const bool partial = [] {
+		const char* value = std::getenv("KYTY_WALKER_PREFETCH_PARTIAL");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (emitted > MaxEmitted && !partial) return;
+	size_t budget = MaxEmitted;
+	for (size_t g = 0; g < groups.size() && budget != 0; ++g) {
+		const auto& group = groups[g];
+		Load(c.r12, group.hi);
+		c.shl(c.r12, 48);
+		c.shr(c.r12, 16);
+		Load(c.rcx, group.lo);
+		c.and_(c.ecx, ~3u);
+		c.or_(c.r12, c.rcx);
+		for (const auto offset: points[g]) {
+			if (budget == 0) break;
+			budget--;
+			c.prefetcht0(c.ptr[c.r12 + static_cast<int32_t>(offset)]);
+		}
+	}
+	ForgetBase();
+}
+
+// The LoadAddressU32 path of EmitRead at a root fetch: the value ends in rax, an unknown result
+// jumps to `unknown`. Consecutive reads from the same base reuse it from r12.
+void WalkerCompiler::EmitInlineRead(const Node& node, const Xbyak::Label& unknown) {
+	auto&      c    = m_code;
+	const auto args = std::span(node.args);
+	int64_t    immediate =
+	    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[node.inst->Flags<MemoryFlags>().index].offset)) &
+	    ~int64_t {3};
+	if (!m_base_valid || m_base_lo != args[0] || m_base_hi != args[1]) {
+		// r12 = the 48-bit base (high << 32 | low) with its low two bits clear.
+		Load(c.r12, args[1]);
+		c.shl(c.r12, 48);
+		c.shr(c.r12, 16);
+		Load(c.rcx, args[0]);
+		c.and_(c.ecx, ~3u);
+		c.or_(c.r12, c.rcx);
+		m_base_valid = true;
+		m_base_lo    = args[0];
+		m_base_hi    = args[1];
+	}
+	const auto fold = args[2].kind == Kind::Constant
+	                      ? immediate + static_cast<int64_t>(static_cast<uint32_t>(args[2].value) & ~3u)
+	                      : INT64_MAX;
+	if (fold >= INT32_MIN && fold <= INT32_MAX) {
+		c.lea(c.r10, c.ptr[c.r12 + static_cast<int32_t>(fold)]);
+	} else {
+		Load(c.r9, args[2]);
+		c.and_(c.r9d, ~3u);
+		c.lea(c.r10, c.ptr[c.r12 + c.r9 + static_cast<size_t>(immediate)]);
+	}
+	c.mov(c.rcx, c.r10);
+	c.shr(c.rcx, 48);
+	c.jnz(unknown, Near);
+	if (node.condition_only) {
+		LoadGuestOrUnknown(c, c.r10, unknown);
+	} else {
+		LoadGuest(c, c.r10);
+	}
+	++m_captures;
+	c.mov(c.qword[c.r8], c.r10);
+	c.add(c.r8, 8);
 }
 
 // Sets eax to 1 when the condition holds, else 0.
@@ -789,21 +1108,34 @@ void WalkerCompiler::Set(void (Xbyak::CodeGenerator::*condition)(const Xbyak::Op
 void WalkerCompiler::Store(const Node& node) {
 	auto& c = m_code;
 	c.mov(c.qword[c.rdx + node.slot], c.rax);
+	if (m_done != nullptr) {
+		c.jmp(*m_done, Near);
+		return;
+	}
 	c.mov(c.byte[c.rdx + node.state], 2);
 	c.ret();
 }
 
 void WalkerCompiler::EmitNode(uint32_t index) {
-	auto&       c    = m_code;
-	auto&       node = m_nodes[index];
-	const auto& args = node.args;
+	auto& c    = m_code;
+	auto& node = m_nodes[index];
 	c.L(node.label);
 	c.cmp(c.byte[c.rdx + node.state], 0);
 	c.jne(m_ret, Near);
 	c.mov(c.byte[c.rdx + node.state], 1);
+	m_fail = &m_ret;
+	m_done = nullptr;
+	EmitBody(index);
+}
+
+// The value's computation: stores it (Store) or leaves through Fail() when it is unknown.
+void WalkerCompiler::EmitBody(uint32_t index) {
+	auto&       c    = m_code;
+	auto&       node = m_nodes[index];
+	const auto& args = node.args;
 	if (node.result != Operand {Kind::Node, index}) {
 		// A cycle referenced this value before it folded to another operand.
-		Fetch(node.result, m_ret);
+		Fetch(node.result, Fail());
 		Store(node);
 		return;
 	}
@@ -817,11 +1149,11 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 				Xbyak::Label next, first;
 				c.cmp(c.byte[c.rdx + m_reach + blocks[i]], 0);
 				c.je(next, Near);
-				Fetch(args[i], m_ret);
+				Fetch(args[i], Fail());
 				c.cmp(state, 1);
 				c.je(first, Near);
 				c.cmp(c.rax, c.qword[c.rdx + node.slot]);
-				c.jne(m_ret, Near);
+				c.jne(Fail(), Near);
 				c.jmp(next, Near);
 				c.L(first);
 				c.mov(c.qword[c.rdx + node.slot], c.rax);
@@ -829,7 +1161,7 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 				c.L(next);
 			}
 			c.cmp(state, 3);
-			c.jne(m_ret, Near);
+			c.jne(Fail(), Near);
 			c.mov(state, 2);
 			c.ret();
 			return;
@@ -841,13 +1173,13 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32: {
 			Xbyak::Label other;
-			Fetch(args[0], m_ret);
+			Fetch(args[0], Fail());
 			c.test(c.rax, c.rax);
 			c.jz(other, Near);
-			Fetch(args[1], m_ret);
+			Fetch(args[1], Fail());
 			Store(node);
 			c.L(other);
-			Fetch(args[2], m_ret);
+			Fetch(args[2], Fail());
 			Store(node);
 			return;
 		}
@@ -855,10 +1187,10 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 		case ValueOpcode::ULessThanEqual32: {
 			const bool less = node.inst->GetOpcode() == ValueOpcode::ULessThan32;
 			Xbyak::Label bound_zero;
-			Fetch(args[0], m_ret);
+			Fetch(args[0], Fail());
 			c.test(c.eax, c.eax);
 			c.jz(bound_zero, Near);
-			Branch(args[1], m_ret);
+			Branch(args[1], Fail());
 			Load(c.rax, args[0]);
 			Load(c.rcx, args[1]);
 			// ULT tests other < bound, ULE bound <= other.
@@ -886,7 +1218,7 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 				Load(c.rax, args[0]);
 				c.test(c.rax, c.rax);
 				decide();
-				Fetch(args[1], m_ret);
+				Fetch(args[1], Fail());
 				c.test(c.rax, c.rax);
 				Set(&Xbyak::CodeGenerator::setne);
 				Store(node);
@@ -901,9 +1233,9 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 					decide();
 				}
 				c.L(refine);
-				Fetch(args[2], m_ret);
+				Fetch(args[2], Fail());
 				c.test(c.rax, c.rax);
-				c.jnz(m_ret, Near);
+				c.jnz(Fail(), Near);
 			}
 			c.L(decided);
 			c.mov(c.eax, uint32_t {!conjunction});
@@ -923,14 +1255,14 @@ void WalkerCompiler::EmitRead(const Node& node) {
 	auto args = std::span(node.args);
 	Xbyak::Label zero;
 	if (vector) {
-		Fetch(args[0], m_ret);
+		Fetch(args[0], Fail());
 		c.test(c.rax, c.rax);
 		c.jz(zero, Near);
 		args = args.subspan(1);
-		if (args.empty()) c.jmp(m_ret, Near);
+		if (args.empty()) c.jmp(Fail(), Near);
 	}
 	if (!args.empty()) {
-		for (const auto& arg: args) Branch(arg, m_ret);
+		for (const auto& arg: args) Branch(arg, Fail());
 		const auto immediate =
 		    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset)) &
 		    ~int64_t {3};
@@ -947,9 +1279,9 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.rax, c.ptr[c.rax + c.r9 + static_cast<size_t>(immediate)]);
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
-			c.jnz(m_ret, Near);
+			c.jnz(Fail(), Near);
 			if (node.condition_only) {
-				LoadGuestOrUnknown(c, c.rax, m_ret);
+				LoadGuestOrUnknown(c, c.rax, Fail());
 			} else {
 				LoadGuest(c, c.rax);
 			}
@@ -959,10 +1291,10 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			if (vector) {
 				// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
 				c.test(c.r11d, 1u << 15u);
-				c.jnz(m_ret, Near);
+				c.jnz(Fail(), Near);
 				Load(c.rcx, args[4]);
 				c.test(c.ecx, (1u << 23u) | 0xf0000000u);
-				c.jnz(m_ret, Near);
+				c.jnz(Fail(), Near);
 				c.test(c.r11d, 0x3fffu);
 				c.jz(zero, Near);
 				c.test(c.ecx, 0x7fu << 12u);
@@ -983,7 +1315,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
 			if (node.condition_only) {
-				LoadGuestOrUnknown(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_ret);
+				LoadGuestOrUnknown(c, c.rax + c.r9 + static_cast<size_t>(immediate), Fail());
 			} else {
 				LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
 			}
@@ -1001,7 +1333,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 void WalkerCompiler::EmitStrict(const Node& node) {
 	auto&       c    = m_code;
 	const auto& inst = *node.inst;
-	for (const auto& arg: node.args) Branch(arg, m_ret);
+	for (const auto& arg: node.args) Branch(arg, Fail());
 	const std::array regs {c.rax, c.rcx, c.r9, c.r11};
 	for (size_t i = 0; i < node.args.size() && i < regs.size(); ++i) Load(regs[i], node.args[i]);
 	// Field ops require offset + width <= 32. Leaves (1 << width) - 1 in r11, the offset in
@@ -1009,7 +1341,7 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 	const auto field = [&](const Xbyak::Reg32& offset, const Xbyak::Reg32& width) {
 		c.lea(c.r10, c.ptr[offset.cvt64() + width.cvt64()]);
 		c.cmp(c.r10, 32);
-		c.ja(m_ret, Near);
+		c.ja(Fail(), Near);
 		c.mov(c.r10, c.rcx);
 		c.mov(c.ecx, width);
 		c.mov(c.r11d, 1);
@@ -1095,11 +1427,11 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 		case ValueOpcode::FPRecipIFlag32:
 			// Normal positive powers of two have exact normal reciprocals in every FP mode.
 			c.test(c.eax, 0x807fffffu);
-			c.jnz(m_ret, Near);
+			c.jnz(Fail(), Near);
 			c.shr(c.eax, 23);
-			c.jz(m_ret, Near);
+			c.jz(Fail(), Near);
 			c.cmp(c.eax, 254);
-			c.jae(m_ret, Near);
+			c.jae(Fail(), Near);
 			c.neg(c.eax);
 			c.add(c.eax, 254);
 			c.shl(c.eax, 23);
@@ -1235,6 +1567,29 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		}
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
+	{
+		// Root fetches that run at most once per walk. Block conditions do not count: the
+		// reachability pass can evaluate them repeatedly (restarts, retreating edges), so a
+		// condition use keeps its read a memoized thunk.
+		// One entry per emitted fetch site: with blocks, a flat slot is fetched once per block
+		// that lists it.
+		std::vector<Operand> roots;
+		if (blocks.empty()) {
+			roots.assign(reads.begin(), reads.end());
+		} else {
+			for (const auto& block: blocks) {
+				for (const auto slot: block.srt_reads) {
+					if (slot < reads.size()) roots.push_back(reads[slot]);
+				}
+			}
+		}
+		for (const auto& words: descriptors) roots.insert(roots.end(), words.begin(), words.end());
+		roots.insert(roots.end(), outputs.begin(), outputs.end());
+		// Each condition counts twice, so it is never a read's single use.
+		for (int twice = 0; twice < 2; ++twice) roots.insert(roots.end(), conditions.begin(), conditions.end());
+		MarkInlinedReads(roots);
+		MarkNestedThunks(roots);
+	}
 	Layout();
 	{
 		// Values a descriptor, flat read or output depends on must stay exact; any other node
@@ -1268,7 +1623,10 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	}
 
 	Xbyak::Label pass, fail, reset;
+	// r12 caches the base of inlined reads (callee-saved; restored at both root exits).
+	c.push(c.r12);
 	c.mov(c.qword[c.rdx + m_shader_base], c.rcx);
+	EmitPrefetches();
 	Zero(m_reach, m_states_end - m_reach);
 	c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
 	if (!resources) {
@@ -1283,11 +1641,23 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			for (const auto block: m_plan.control_phi_predecessors.at(node.inst)) rechecks[block].push_back(node.state);
 		}
 		std::vector<Xbyak::Label> starts(blocks.size());
+		// KYTY_WALKER_FAST_MARKS=0 disables (2026-11-07 part 12): marking a forward successor that
+		// no control Phi rechecks is a plain store. Setting a set flag changes nothing, and only a
+		// newly reached block with rechecks or a retreating edge needs the test. The reference
+		// walker (KYTY_WALKER_VERIFY) keeps the tested form.
+		static const bool fast_marks = [] {
+			const char* value = std::getenv("KYTY_WALKER_FAST_MARKS");
+			return value == nullptr || value[0] != '0';
+		}();
 		c.mov(c.byte[c.rdx + m_reach], 1);
 		c.L(pass);
 		for (uint32_t block = 0; block < blocks.size(); ++block) {
 			Xbyak::Label next;
 			const auto mark = [&](uint32_t target) {
+				if (fast_marks && m_allow_inline && target > block && rechecks[target].empty()) {
+					c.mov(c.byte[c.rdx + m_reach + target], 1);
+					return;
+				}
 				Xbyak::Label reached;
 				c.cmp(c.byte[c.rdx + m_reach + target], 0);
 				c.jne(reached, Near);
@@ -1324,6 +1694,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			c.L(next);
 		}
 	}
+	ForgetBase();
 	if (resources) {
 		const auto flat = [&](uint32_t slot) {
 			const auto offset = slot < reads.size() ? m_plan.srt_reads[slot].flat_offset : UINT32_MAX;
@@ -1344,6 +1715,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			c.je(skip, Near);
 			for (const auto slot: blocks[block].srt_reads) flat(slot);
 			c.L(skip);
+			ForgetBase();
 		}
 		// A source or image no block lists is always active.
 		for (uint32_t index = 0; index < sources.size() + m_plan.info.images.size(); ++index) {
@@ -1373,12 +1745,14 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			const auto known = c.dword[c.rdx + source * DescriptorStride + 8u * sizeof(uint32_t)];
 			c.mov(known, 0);
 			Gate(gates[source], skip);
+			ForgetBase();
 			for (uint32_t word = 0; word < descriptors[source].size(); ++word) {
 				Fetch(descriptors[source][word], skip);
 				c.mov(c.dword[c.rdx + source * DescriptorStride + word * sizeof(uint32_t)], c.eax);
 			}
 			c.mov(known, 1);
 			c.L(skip);
+			ForgetBase();
 		}
 	}
 	for (uint32_t index = 0; index < outputs.size(); ++index) {
@@ -1386,16 +1760,22 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		const auto output = c.qword[c.rdx + OutputOffset(m_plan) + index * 8u];
 		c.mov(output, -1);
 		Gate(m_output_gates[index], skip);
+		ForgetBase();
 		Fetch(outputs[index], skip);
 		c.mov(c.eax, c.eax);
 		c.mov(output, c.rax);
 		c.L(skip);
+		ForgetBase();
 	}
 	c.mov(c.rax, c.r8);
+	c.pop(c.r12);
+	c.ret();
+	// Thunks return through m_ret; the root code never jumps there.
 	c.L(m_ret);
 	c.ret();
 	c.L(fail);
 	c.xor_(c.eax, c.eax);
+	c.pop(c.r12);
 	c.ret();
 	if (resources && !blocks.empty()) {
 		c.L(reset);
@@ -1410,13 +1790,220 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	m_plan.srt_user_data = m_user_data;
 	c.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
+	DumpComposition();
 }
 
 } // namespace
 
+namespace {
+// KYTY_WALKER_VERIFY=1: every walker also gets a reference build without inlined reads; each
+// walk runs both and compares flat reads, known descriptors, activity, outputs and captures.
+struct ReferenceWalker {
+	std::unique_ptr<Xbyak::CodeGenerator> code;
+	uint32_t                              captures = 0;
+	size_t                                scratch  = 0;
+	uint32_t                              values_end = 0;
+};
+bool WalkerVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WALKER_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+std::mutex g_reference_mutex;
+std::unordered_map<const Xbyak::CodeGenerator*, ReferenceWalker> g_reference_walkers;
+} // namespace
+
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
+	ReferenceWalker reference;
+	if (WalkerVerifyEnabled()) {
+		reference.code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
+		WalkerCompiler compiler(plan, *reference.code, false);
+		compiler.Compile(values);
+		reference.captures   = plan.srt_captures;
+		reference.scratch    = plan.srt_scratch.size();
+		reference.values_end = compiler.ValuesEnd();
+	}
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
+	if (reference.code) {
+		std::scoped_lock lock(g_reference_mutex);
+		g_reference_walkers[plan.srt_code.get()] = std::move(reference);
+	}
+}
+
+namespace {
+// KYTY_WALK_STATS=<seconds>: that long after the first walk, print the plans with the most walker
+// time (calls, ns per call, flat reads, scratch words, code bytes) once.
+struct WalkStat {
+	uint64_t calls = 0;
+	uint64_t ns    = 0;
+	uint64_t warm_ns = 0; // an immediate second walk (warm caches)
+	uint64_t hash  = 0;
+	uint32_t stage = 0;
+	size_t   flat  = 0;
+	size_t   scratch = 0;
+	size_t   code  = 0;
+	uint64_t key_hits = 0, out_hits = 0;
+	std::array<std::pair<uint64_t, uint64_t>, 8> ring {};
+	uint32_t ring_next = 0;
+};
+uint64_t HashWords(const void* data, size_t bytes, uint64_t seed) {
+	// FNV-1a over 64-bit words; statistics only.
+	const auto* words = static_cast<const uint64_t*>(data);
+	uint64_t    h     = seed ^ 0xcbf29ce484222325ull;
+	for (size_t i = 0; i < bytes / 8u; ++i) h = (h ^ words[i]) * 0x100000001b3ull;
+	const auto* tail = static_cast<const uint8_t*>(data) + (bytes & ~size_t {7});
+	for (size_t i = 0; i < (bytes & 7u); ++i) h = (h ^ tail[i]) * 0x100000001b3ull;
+	return h;
+}
+const char* WalkStatsEnv() {
+	static const char* env = std::getenv("KYTY_WALK_STATS");
+	return env;
+}
+void RecordWalk(const ResourcePlan& plan, uint64_t ns, uint64_t warm_ns, std::span<const uint32_t> user_data,
+                const std::vector<uint32_t>& flat, const uint64_t* end) {
+	using Clock = std::chrono::steady_clock;
+	static thread_local std::unordered_map<const ResourcePlan*, WalkStat> stats;
+	static thread_local Clock::time_point report_at {};
+	static thread_local Clock::time_point start_at {};
+	static thread_local bool reported = false;
+	if (reported) return;
+	if (report_at == Clock::time_point {}) {
+		// KYTY_WALK_STATS=<report s>[,<start s>]: both counted from the first walk; walks before
+		// <start s> are not recorded (e.g. to cover only the pre-game intro).
+		const char* env   = WalkStatsEnv();
+		const char* comma = std::strchr(env, ',');
+		const auto  now   = Clock::now();
+		report_at         = now + std::chrono::seconds(std::atoi(env));
+		start_at          = now + std::chrono::seconds(comma != nullptr ? std::atoi(comma + 1) : 0);
+	}
+	if (Clock::now() < start_at) return;
+	auto& stat = stats[&plan];
+	stat.calls++;
+	stat.ns += ns;
+	stat.warm_ns += warm_ns;
+	stat.hash = plan.shader_hash;
+	stat.stage = static_cast<uint32_t>(plan.stage);
+	stat.flat = plan.srt_reads.size();
+	stat.scratch = plan.srt_scratch.size();
+	stat.code = plan.srt_code->getSize();
+	if (end != nullptr) {
+		const auto key = HashWords(user_data.data(), std::min<size_t>(user_data.size(), plan.srt_user_data) * 4u, 1);
+		// Output: flat reads plus the scratch up to the end of the captured addresses.
+		const auto out = HashWords(plan.srt_scratch.data(),
+		                           static_cast<size_t>(end - plan.srt_scratch.data()) * 8u,
+		                           HashWords(flat.data(), flat.size() * 4u, 2));
+		bool key_hit = false, out_hit = false;
+		for (const auto& [k, o]: stat.ring) {
+			if (k != key) continue;
+			key_hit = true;
+			out_hit |= o == out;
+		}
+		stat.key_hits += key_hit;
+		stat.out_hits += out_hit;
+		stat.ring[stat.ring_next++ % stat.ring.size()] = {key, out};
+	}
+	if ((stat.calls & 255u) != 0u || Clock::now() < report_at) return;
+	reported = true;
+	std::vector<WalkStat> rows;
+	uint64_t total = 0, total_calls = 0, key_hits = 0, out_hits = 0;
+	uint64_t key_ns = 0, out_ns = 0, warm_total = 0;
+	for (const auto& [key, value]: stats) {
+		rows.push_back(value);
+		total += value.ns;
+		total_calls += value.calls;
+		warm_total += value.warm_ns;
+		key_hits += value.key_hits;
+		out_hits += value.out_hits;
+		key_ns += value.ns * value.key_hits / std::max<uint64_t>(value.calls, 1);
+		out_ns += value.ns * value.out_hits / std::max<uint64_t>(value.calls, 1);
+	}
+	std::printf("SRT walker repeats: calls=%llu key_hits=%.1f%% out_hits=%.1f%% (time-weighted %.1f%% / %.1f%%)\n",
+	            static_cast<unsigned long long>(total_calls),
+	            100.0 * static_cast<double>(key_hits) / static_cast<double>(std::max<uint64_t>(total_calls, 1)),
+	            100.0 * static_cast<double>(out_hits) / static_cast<double>(std::max<uint64_t>(total_calls, 1)),
+	            100.0 * static_cast<double>(key_ns) / static_cast<double>(std::max<uint64_t>(total, 1)),
+	            100.0 * static_cast<double>(out_ns) / static_cast<double>(std::max<uint64_t>(total, 1)));
+	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.ns > b.ns; });
+	std::printf("SRT walker stats: %zu plans, %.1f ms total, %.1f ms for the warm repeats\n", rows.size(),
+	            static_cast<double>(total) / 1e6, static_cast<double>(warm_total) / 1e6);
+	for (size_t i = 0; i < rows.size() && i < 40; ++i) {
+		const auto& r = rows[i];
+		std::printf("  walk hash=%016llx stage=%u calls=%llu key=%.0f%% out=%.0f%% ns/call=%.0f warm=%.0f share=%.1f%% flat=%zu scratch=%zu code=%zu\n",
+		            static_cast<unsigned long long>(r.hash), r.stage, static_cast<unsigned long long>(r.calls),
+		            100.0 * static_cast<double>(r.key_hits) / static_cast<double>(r.calls),
+		            100.0 * static_cast<double>(r.out_hits) / static_cast<double>(r.calls),
+		            static_cast<double>(r.ns) / static_cast<double>(r.calls),
+		            static_cast<double>(r.warm_ns) / static_cast<double>(r.calls),
+		            100.0 * static_cast<double>(r.ns) / static_cast<double>(std::max<uint64_t>(total, 1)),
+		            r.flat, r.scratch, r.code);
+	}
+	std::fflush(stdout);
+}
+} // namespace
+
+static void VerifyWalk(const ResourcePlan& plan, const SrtRuntime& runtime,
+                       const std::vector<uint32_t>& flat, const uint64_t* end) {
+	const ReferenceWalker* reference = nullptr;
+	{
+		std::scoped_lock lock(g_reference_mutex);
+		const auto found = g_reference_walkers.find(plan.srt_code.get());
+		if (found == g_reference_walkers.end()) return;
+		reference = &found->second;
+	}
+	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
+	static thread_local std::vector<uint64_t> scratch;
+	static thread_local std::vector<uint32_t> ref_flat;
+	scratch.assign(reference->scratch, 0u);
+	ref_flat.assign(plan.srt_reads.size(), 0u);
+	const auto* previous = t_running_walker;
+	t_running_walker = reference->code.get();
+	const auto* ref_end = reference->code->getCode<Walker>()(runtime.user_data.data(), ref_flat.data(),
+	                                                         scratch.data(), runtime.shader_base);
+	t_running_walker = previous;
+	static std::atomic<uint32_t> walks {0}, mismatches {0};
+	const auto n = walks.fetch_add(1, std::memory_order_relaxed) + 1u;
+	std::string why;
+	if ((end == nullptr) != (ref_end == nullptr)) {
+		why = fmt::format("result {} vs reference {}", end != nullptr, ref_end != nullptr);
+	} else if (end != nullptr) {
+		const auto* now  = Scratch(plan);
+		const auto* then = reinterpret_cast<const uint8_t*>(scratch.data());
+		if (flat != ref_flat) why = "flat reads";
+		for (uint32_t source = 0; why.empty() && source < plan.descriptor_sources.size(); ++source) {
+			uint32_t known_now = 0, known_then = 0;
+			std::memcpy(&known_now, now + source * DescriptorStride + 32u, 4u);
+			std::memcpy(&known_then, then + source * DescriptorStride + 32u, 4u);
+			if (known_now != known_then) {
+				why = fmt::format("source {} known {} vs {}", source, known_now, known_then);
+			} else if (known_now != 0u &&
+			           std::memcmp(now + source * DescriptorStride, then + source * DescriptorStride,
+			                       plan.descriptor_sources[source].dword_count * 4u) != 0) {
+				why = fmt::format("source {} words", source);
+			}
+		}
+		const auto active = ActiveOffset(plan);
+		if (why.empty() && std::memcmp(now + active, then + active, reference->values_end - active) != 0)
+			why = "activity or outputs";
+		const auto* captures_now  = plan.srt_scratch.data() + plan.srt_captures / 8u;
+		const auto* captures_then = scratch.data() + reference->captures / 8u;
+		if (why.empty() && (end - captures_now != ref_end - captures_then ||
+		                    !std::equal(captures_now, end, captures_then)))
+			why = fmt::format("captures {} vs {}", end - captures_now, ref_end - captures_then);
+	}
+	if (!why.empty()) {
+		const auto bad = mismatches.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (bad <= 20u)
+			std::printf("SRT walker verify MISMATCH hash=%016llx stage=%u: %s\n",
+			            static_cast<unsigned long long>(plan.shader_hash), static_cast<uint32_t>(plan.stage),
+			            why.c_str());
+	}
+	if ((n & ((1u << 20u) - 1u)) == 0u) {
+		std::printf("SRT walker verify: %u walks, %u mismatches\n", n, mismatches.load());
+		std::fflush(stdout);
+	}
 }
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
@@ -1424,13 +2011,33 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
+	Common::DebugCounters::StageTimer walk_timer(Common::DebugCounters::Counter::WalkSrtNs);
+	const bool stats = WalkStatsEnv() != nullptr;
+	const auto walk_begin = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	t_running_walker = plan.srt_code.get();
+	auto* const scratch = plan.srt_scratch.data();
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
+	                                                     scratch, runtime.shader_base);
 	t_running_walker = nullptr;
+	if (stats) {
+		const auto walk_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    std::chrono::steady_clock::now() - walk_begin).count());
+		// Same inputs again: the code and guest lines are now cached.
+		static thread_local std::vector<uint32_t> warm_flat;
+		warm_flat.assign(flat.size(), 0u);
+		const auto warm_begin = std::chrono::steady_clock::now();
+		t_running_walker = plan.srt_code.get();
+		(void)plan.srt_code->getCode<Walker>()(runtime.user_data.data(), warm_flat.data(),
+		                                       scratch, runtime.shader_base);
+		t_running_walker = nullptr;
+		const auto warm_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    std::chrono::steady_clock::now() - warm_begin).count());
+		RecordWalk(plan, walk_ns, warm_ns, runtime.user_data, flat, end);
+	}
+	if (WalkerVerifyEnabled()) VerifyWalk(plan, runtime, flat, end);
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
-		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
+		for (auto* read = scratch + plan.srt_captures / 8u; read != end; ++read)
 			reads->emplace_back(*read, sizeof(uint32_t));
 	}
 	return true;
@@ -1501,6 +2108,28 @@ uint32_t SrtWalkerUnknownSkip(uint64_t rip) {
 	// mov eax, [r10]; jmp short +5; jmp near <unknown>
 	const auto* code = reinterpret_cast<const uint8_t*>(rip + length);
 	return code[0] == 0xebu && code[1] == 0x05u && code[2] == 0xe9u ? length + 2u : 0;
+}
+
+namespace {
+thread_local bool t_walker_helper  = false;
+thread_local bool t_walker_aborted = false;
+} // namespace
+
+void SetSrtWalkerHelperThread(bool helper) {
+	t_walker_helper = helper;
+}
+
+uint32_t SrtWalkerHelperAbort(uint64_t rip) {
+	if (!t_walker_helper) return 0;
+	const auto length = SrtWalkerLoadLength(rip);
+	if (length != 0) t_walker_aborted = true;
+	return length;
+}
+
+bool TakeSrtWalkerHelperAborted() {
+	const bool aborted = t_walker_aborted;
+	t_walker_aborted   = false;
+	return aborted;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

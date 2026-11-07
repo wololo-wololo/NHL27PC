@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -67,9 +68,17 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	if (stamp == 0) {
 		return {};
 	}
+	// Environment switches that change translation: a store written under other settings is
+	// not reused.
+	const auto env_on = [](const char* name) {
+		const char* value = std::getenv(name);
+		return value != nullptr && value[0] == '1';
+	};
+	const uint32_t codegen_switches = (env_on("KYTY_GPU_BUFFER_DESCRIPTORS") ? 1u : 0u) |
+	                                  (env_on("KYTY_LOOP_WATCHDOG") ? 2u : 0u);
 	Writer header;
 	IoAll(header, stamp, SpirvProfile(graphics),
-	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
+	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize, codegen_switches);
 	return std::move(header.bytes);
 }
 

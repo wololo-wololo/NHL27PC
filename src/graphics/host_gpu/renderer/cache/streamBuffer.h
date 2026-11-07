@@ -70,6 +70,8 @@ public:
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
+	// Part of the guest-memory mirror (KYTY_GPU_MIRROR): never evicted by the garbage collector.
+	bool   pinned       = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
 

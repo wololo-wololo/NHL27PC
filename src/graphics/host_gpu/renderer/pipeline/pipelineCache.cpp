@@ -44,7 +44,10 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+// Cold driver compiles of NHL 27's compute pipelines take 1-5 s each; several in a row stall the
+// GPU thread past the game's own ~5 s GPU watchdog, which then core-dumps. Saving every 5 min
+// lost those compiles in every such run; at 30 s each crashed run still keeps its progress.
+constexpr auto DriverCacheSaveInterval = std::chrono::seconds {30};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -282,8 +285,11 @@ template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor) {
 	Common::DebugCounters::StageSequence stages(Common::DebugCounters::Counter::ProgramMaterializeNs);
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization, materialize_memo));
+	if (materialized_ahead) {
+		materialized_ahead = false;
+	} else {
+		Materialize(runtime);
+	}
 	stages.Next(Common::DebugCounters::Counter::ProgramMatchNs);
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
@@ -298,6 +304,31 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 		return &candidate;
 	}
 	return nullptr;
+}
+
+
+void PipelineCache::Program::Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+	const bool profile          = Common::DebugCounters::Enabled();
+	const auto exceptions_before = Common::DebugCounters::t_host_exceptions;
+	const auto materialize_begin =
+	    profile ? Common::DebugCounters::FastClock::now() : Common::DebugCounters::FastClock::time_point {};
+	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+	                                                    specialization, materialize_memo));
+	if (profile) {
+		using Common::DebugCounters::Counter;
+		const auto ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(
+		        Common::DebugCounters::FastClock::now() - materialize_begin)
+		        .count());
+		const auto exceptions = Common::DebugCounters::t_host_exceptions - exceptions_before;
+		if (exceptions != 0) {
+			Common::DebugCounters::Add(Counter::MaterializeFaultCalls);
+			Common::DebugCounters::Add(Counter::MaterializeFaultExceptions, exceptions);
+			Common::DebugCounters::Add(Counter::MaterializeFaultNs, ns);
+		} else {
+			Common::DebugCounters::Add(Counter::MaterializeCleanNs, ns);
+		}
+	}
 }
 
 ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& key,
@@ -401,6 +432,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		runtime.workgroup_counts   = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
 	}
+	JoinAhead();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::ProgramLookups);
 	std::optional<Common::DebugCounters::StageTimer> key_stage(std::in_place, Common::DebugCounters::Counter::ProgramKeyNs);
 	m_lookup_key.stage           = options.stage;
@@ -482,6 +514,196 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	                          push_data_cursor));
 }
 
+// Opt-in, KYTY_ASYNC_MATERIALIZE=1 (2026-11-06: exact over 3.1 M verified results, but no FPS
+// gain on the 8-core 9800X3D: the GPU thread saved ~31 ms/s of materialization and lost about the
+// same to waiting and to slower draw execution while the helper spun). A helper thread materializes the pixel shader's
+// resources (SRT walk, descriptor decode, specialization) while the GPU thread does the vertex
+// stage. Only plans whose materialization reads nothing but the walked guest memory qualify; a
+// walker load that faults on the helper aborts the walk (no buffer-cache access off the GPU
+// thread), and the lookup then materializes on the GPU thread as before.
+static bool AsyncMaterializeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_MATERIALIZE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static bool AsyncMaterializeVerify() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_MATERIALIZE_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static bool HelperEligible(const ShaderRecompiler::IR::ResourcePlan& plan) {
+	return plan.resource_tracking_complete && plan.srt_code != nullptr &&
+	       !plan.capture_specialization_reads && plan.source_reads.empty() &&
+	       plan.selector_keys.empty() &&
+	       std::ranges::none_of(plan.descriptor_sources, [](const auto& source) {
+		       return source.indirect_descriptor.has_value();
+	       });
+}
+
+class MaterializeWorker {
+public:
+	MaterializeWorker(): m_thread([this](std::stop_token stop) { Run(stop); }) {}
+	~MaterializeWorker() {
+		m_thread.request_stop();
+		m_state.store(Stop, std::memory_order_release);
+		m_state.notify_one();
+	}
+	KYTY_CLASS_NO_COPY(MaterializeWorker);
+
+	void Post(PipelineCache::Program& program, const ShaderRecompiler::IR::SrtRuntime& runtime) {
+		m_program = &program;
+		m_user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+		m_runtime           = runtime;
+		m_runtime.user_data = m_user_data;
+		m_state.store(Posted, std::memory_order_release);
+		if (m_sleeping.load(std::memory_order_acquire)) {
+			m_state.notify_one();
+		}
+	}
+	// True when the helper materialized the program completely.
+	bool Join() {
+		Common::DebugCounters::StageTimer timer(Common::DebugCounters::Counter::AsyncMaterializeWaitNs);
+		while (m_state.load(std::memory_order_acquire) != Done) {
+			_mm_pause();
+		}
+		m_state.store(Idle, std::memory_order_relaxed);
+		return m_ok;
+	}
+	[[nodiscard]] const ShaderRecompiler::IR::SrtRuntime& Runtime() const { return m_runtime; }
+
+private:
+	enum : uint32_t { Idle, Posted, Done, Stop };
+
+	void Run(std::stop_token stop) {
+		ShaderRecompiler::IR::SetSrtWalkerHelperThread(true);
+		while (!stop.stop_requested()) {
+			// Spin a while (draws come every few microseconds), then sleep.
+			uint32_t spins = 0;
+			uint32_t state = m_state.load(std::memory_order_acquire);
+			while (state != Posted && state != Stop) {
+				if (++spins < 20000u) {
+					_mm_pause();
+				} else {
+					m_sleeping.store(true, std::memory_order_release);
+					m_state.wait(state, std::memory_order_acquire);
+					m_sleeping.store(false, std::memory_order_release);
+				}
+				state = m_state.load(std::memory_order_acquire);
+			}
+			if (state == Stop) break;
+			auto& program = *m_program;
+			(void)ShaderRecompiler::IR::TakeSrtWalkerHelperAborted();
+			const bool ok = ShaderRecompiler::IR::MaterializeResources(
+			    program.resource_plan, m_runtime, program.resources, program.specialization,
+			    program.materialize_memo);
+			const bool aborted = ShaderRecompiler::IR::TakeSrtWalkerHelperAborted();
+			m_ok = ok && !aborted;
+			if (aborted) Common::DebugCounters::Add(Common::DebugCounters::Counter::AsyncMaterializeAborted);
+			m_state.store(Done, std::memory_order_release);
+		}
+	}
+
+	std::atomic<uint32_t>            m_state {Idle};
+	std::atomic<bool>                m_sleeping {false};
+	PipelineCache::Program*          m_program = nullptr;
+	std::vector<uint32_t>            m_user_data;
+	ShaderRecompiler::IR::SrtRuntime m_runtime;
+	bool                             m_ok = false;
+	std::jthread                     m_thread;
+};
+
+template <typename InputInfo>
+PipelineCache::Program* PipelineCache::FindAheadProgram(const ShaderParams& params, InputInfo& input_info,
+                                                        ShaderRecompiler::IR::SrtRuntime& runtime) {
+	runtime = {
+	    .user_data                  = std::span(params.user_data).first(params.user_data_count),
+	    .shader_base                = params.Base(),
+	    .read_specialization_memory = ReadShaderGuestMemory,
+	    .image_heap                 = m_image_heap,
+	};
+	auto& key = m_ahead_key;
+	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+		key.stage = input_info.logical_stage;
+	} else {
+		static_assert(std::is_same_v<InputInfo, ShaderPixelInputInfo>);
+		key.stage = ShaderType::Pixel;
+	}
+	key.hash            = params.hash;
+	key.user_data_count = params.user_data_count;
+	BuildStageStaticKey(input_info, key.static_state);
+	const auto entry = m_program_cache.find(key);
+	if (entry == m_program_cache.end()) return nullptr;
+	auto& program = entry->second;
+	if (program.skip_dispatch || program.call_source || program.modules.empty() ||
+	    !program.resource_plan.resource_tracking_complete) {
+		return nullptr;
+	}
+	return &program;
+}
+
+template <typename InputInfo>
+void PipelineCache::MaterializeAhead(const ShaderParams& params, InputInfo& input_info, bool on_helper) {
+	ShaderRecompiler::IR::SrtRuntime runtime;
+	auto* program = FindAheadProgram(params, input_info, runtime);
+	if (program == nullptr) return;
+	if (on_helper) {
+		if (m_materialize_worker == nullptr || m_ahead_program != nullptr ||
+		    !HelperEligible(program->resource_plan)) {
+			return;
+		}
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::AsyncMaterializePosted);
+		m_materialize_worker->Post(*program, runtime);
+		m_ahead_program = program;
+		return;
+	}
+	Common::DebugCounters::StageTimer timer(Common::DebugCounters::Counter::ProgramMaterializeNs);
+	program->Materialize(runtime);
+	program->materialized_ahead = true;
+}
+
+void PipelineCache::JoinAhead() {
+	if (m_ahead_program == nullptr) return;
+	auto& program = *m_ahead_program;
+	m_ahead_program = nullptr;
+	const bool ok = m_materialize_worker->Join();
+	if (!ok) return;
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::AsyncMaterializeUsed);
+	if (AsyncMaterializeVerify()) {
+		// The GPU thread's result for the same inputs must be identical.
+		ShaderRecompiler::IR::ResourceSnapshot       snapshot;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderRecompiler::IR::MaterializeMemo        memo;
+		const bool again = ShaderRecompiler::IR::MaterializeResources(
+		    program.resource_plan, m_materialize_worker->Runtime(), snapshot, specialization, memo);
+		const bool same = again && specialization == program.specialization &&
+		                  snapshot.buffers == program.resources.buffers &&
+		                  snapshot.images == program.resources.images &&
+		                  snapshot.samplers == program.resources.samplers &&
+		                  snapshot.flattened_srt == program.resources.flattened_srt &&
+		                  snapshot.user_data == program.resources.user_data;
+		static std::atomic<uint32_t> checks {0}, mismatches {0};
+		const auto n = checks.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (!same) {
+			const auto bad = mismatches.fetch_add(1, std::memory_order_relaxed) + 1u;
+			if (bad <= 20u) {
+				std::printf("Async materialize MISMATCH shader=%016llx\n",
+				            static_cast<unsigned long long>(program.resource_plan.shader_hash));
+			}
+		}
+		if ((n & 0xfffffu) == 0u) {
+			std::printf("Async materialize verify: %u checks, %u mismatches\n", n, mismatches.load());
+			std::fflush(stdout);
+		}
+	}
+	program.materialized_ahead = true;
+}
+
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
                              const std::filesystem::path&           shader_store)
@@ -490,9 +712,15 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	WarmUp(shader_store);
+	if (AsyncMaterializeEnabled()) {
+		m_materialize_worker = std::make_unique<MaterializeWorker>();
+		std::printf("GPU: asynchronous pixel-shader materialization enabled\n");
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	JoinAhead();
+	m_materialize_worker.reset();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
@@ -869,6 +1097,13 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	if (pixel_active && !tess_active && m_materialize_worker != nullptr &&
+	    Common::DebugCounters::AbVariant()) {
+		MaterializeAhead(pixel_params, pixel_info, true);
+		if (m_ahead_program != nullptr) {
+			MaterializeAhead(vertex_params[0], vertex_info[0], false);
+		}
+	}
 	if (pixel_active) {
 		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
 		for (const auto& output: pixel_module.info.info.outputs) {
@@ -1094,7 +1329,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const auto begin = std::chrono::steady_clock::now();
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+		const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+		if (ms > 500.0) {
+			std::printf("Slow pipeline: graphics VS=%016llx PS=%016llx %.0f ms\n",
+			            static_cast<unsigned long long>(key.stage_ids[0]),
+			            static_cast<unsigned long long>(key.stage_ids[3]), ms);
+		}
 	}
 	StorePipeline(key);
 	CheckpointDriverCache();
@@ -1122,7 +1364,13 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const auto begin = std::chrono::steady_clock::now();
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+		if (ms > 500.0) {
+			std::printf("Slow pipeline: compute module=%016llx %.0f ms\n",
+			            static_cast<unsigned long long>(module.id), ms);
+		}
 	}
 	CheckpointDriverCache();
 

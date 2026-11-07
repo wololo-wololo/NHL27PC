@@ -28,6 +28,9 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_external_memory_host: guest memory imported zero-copy (the host-memory mirror).
+	bool                               host_import_enabled                   = false;
+	uint64_t                           host_import_alignment                 = 0;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
@@ -55,6 +58,17 @@ struct GraphicContext {
 	// Same family as `queue`; used only by the GPU thread (BufferCache side-queue readbacks).
 	vk::Queue                          readback_queue           = nullptr;
 	bool                               readback_queue_available = false;
+	// Same family again; the presenter's submissions and vkQueuePresentKHR. A present can block
+	// in the kernel (e.g. while the display does not take frames); on its own queue and mutex it
+	// no longer blocks rendering submissions. Falls back to `queue` when the family has fewer
+	// than three queues.
+	vk::Queue                          present_queue = nullptr;
+	bool                               present_queue_requested = false;
+	Common::Mutex                      present_queue_mutex;
+	[[nodiscard]] vk::Queue PresentQueue() const { return present_queue != nullptr ? present_queue : queue; }
+	[[nodiscard]] Common::Mutex& PresentQueueMutex() {
+		return present_queue != nullptr ? present_queue_mutex : queue_mutex;
+	}
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

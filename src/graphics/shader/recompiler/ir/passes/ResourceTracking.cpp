@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <fmt/format.h>
 #include <map>
@@ -23,6 +24,18 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
+
+// KYTY_GPU_BUFFER_DESCRIPTORS=1 (GPU-side descriptors, milestone 1): read-only buffer loads
+// (scalar constant loads, raw 8/16/32-bit and formatted X loads) decode their V# in the shader
+// and read through the BDA page table even when the walker could resolve it. Translation
+// changes, so the shader store must be rebuilt (it is keyed by the build anyway).
+bool GpuBufferDescriptors() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_BUFFER_DESCRIPTORS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
@@ -4212,8 +4225,18 @@ private:
 		if (buffer != BufferAccess::None) {
 			handle = inst.Arg(0).Resolve().TryInstruction();
 			const auto* indirect = handle == nullptr ? nullptr : FindIndirectDescriptor(*handle);
+			const auto direct_kind =
+			    op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer : ResourceKind::Buffer;
 			if (indirect != nullptr) {
 				source = indirect->source;
+			} else if (GpuBufferDescriptors() && handle != nullptr &&
+			           handle->GetOpcode() == ValueOpcode::GetBufferResource &&
+			           memory.kind == direct_kind && memory.SupportsIndirectBufferLoad(op)) {
+				// GPU-side buffer descriptors: the shader decodes the V# and reads through the BDA
+				// page table, so the host neither walks, decodes, specializes nor binds it.
+				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+				m_info.uses_dma                         = true;
+				return;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer

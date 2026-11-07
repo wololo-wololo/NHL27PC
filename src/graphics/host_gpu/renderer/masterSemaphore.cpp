@@ -10,7 +10,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <optional>
 
 namespace Libs::Graphics {
 
@@ -77,6 +79,11 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
+	std::optional<Common::DebugCounters::ScopedTimer> gpu_thread_timer;
+	if (Common::DebugCounters::Enabled() && GuestGpu::IsGpuThread()) {
+		gpu_thread_timer.emplace(Common::DebugCounters::Counter::GpuThreadWaits,
+		                         Common::DebugCounters::Counter::GpuThreadWaitNs);
+	}
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	if (result != vk::Result::eSuccess) {
 		ReportGpuCheckpoints(m_graphics);

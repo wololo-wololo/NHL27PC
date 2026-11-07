@@ -15,12 +15,14 @@
 #endif
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -154,10 +156,48 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
 	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ImageCreates,
+	                                         Common::DebugCounters::Counter::ImageCreateNs);
+	const auto* native_info = static_cast<const vk::ImageCreateInfo::NativeType*>(image_info);
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	auto              result       = vk::Result::eErrorUnknown;
+	// NVIDIA reports prefersDedicatedAllocation for render-target images, so VMA gave every such
+	// image its own VkDeviceMemory: a kernel allocation on create and on delete, ~4-5% of the GPU
+	// thread in gameplay, where the texture cache keeps creating and retiring images (asyb-1).
+	// The preference is a hint (dedicated memory is only *required* for external memory, which
+	// these images never use), so with KYTY_IMAGE_SUBALLOC=1 images are suballocated from VMA
+	// blocks: the requirements are queried without the dedicated chain (VMA still dedicates
+	// images larger than half a block); follows KYTY_AB_PERIOD. Measured (isub-1, async, in-run
+	// A/B): create+delete 18.8 -> 16.8 ms/s for ~110 images/s, i.e. the vkCreate/DestroyImage
+	// calls themselves dominate, not the memory. Rendering correct; gain within noise: opt-in.
+	static const bool suballoc_enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_SUBALLOC");
+		return value != nullptr && value[0] == '1';
+	}();
+	vk::Image created = nullptr;
+	if (suballoc_enabled && Common::DebugCounters::AbVariant() &&
+	    device.createImage(&image_info, nullptr, &created) == vk::Result::eSuccess) {
+		const VkMemoryRequirements requirements = device.getImageMemoryRequirements(created);
+		result = static_cast<vk::Result>(
+		    vmaAllocateMemory(allocator, &requirements, &alloc_info, &image.allocation, nullptr));
+		if (result == vk::Result::eSuccess) {
+			result = static_cast<vk::Result>(
+			    vmaBindImageMemory(allocator, image.allocation, static_cast<VkImage>(created)));
+			if (result != vk::Result::eSuccess) {
+				vmaFreeMemory(allocator, image.allocation);
+				image.allocation = nullptr;
+			}
+		}
+		if (result == vk::Result::eSuccess) {
+			native_image = static_cast<VkImage>(created);
+		} else {
+			device.destroyImage(created, nullptr);
+		}
+	}
+	if (native_image == VK_NULL_HANDLE) {
+		result = static_cast<vk::Result>(
+		    vmaCreateImage(allocator, native_info, &alloc_info, &native_image, &image.allocation, nullptr));
+	}
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
@@ -182,6 +222,8 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ImageDeletes,
+	                                         Common::DebugCounters::Counter::ImageDeleteNs);
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
 	image.allocation = nullptr;

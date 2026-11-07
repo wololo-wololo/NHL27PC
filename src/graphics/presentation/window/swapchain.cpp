@@ -25,6 +25,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -41,6 +42,8 @@ struct Presenter::Frame {
 	VulkanImage   image;
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
+	// Tick of the rendering command buffer that filled the frame (0: the presenter's own).
+	uint64_t      render_tick  = 0;
 	bool          busy         = false;
 	bool          hdr          = false;
 	bool          blank        = false;
@@ -280,7 +283,7 @@ public:
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
-	uint64_t Submit(CommandScheduler& scheduler);
+	uint64_t Submit(CommandScheduler& scheduler, vk::Semaphore render = nullptr, uint64_t render_tick = 0);
 	[[nodiscard]] Status Present();
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
@@ -326,7 +329,7 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+	      present_scheduler(renderer, owner.graphic_ctx, false, true), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
@@ -542,6 +545,10 @@ void Swapchain::Destroy() {
 	{
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
+	}
+	if (graphics.present_queue != nullptr) {
+		Common::LockGuard queue_lock(graphics.present_queue_mutex);
+		RequireVulkanSuccess(graphics.present_queue.waitIdle(), "wait for present queue");
 	}
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
@@ -930,10 +937,15 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	}
 }
 
-uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
+uint64_t Swapchain::Submit(CommandScheduler& scheduler, vk::Semaphore render, uint64_t render_tick) {
 	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
+	// The frames were filled on the rendering queue; their flips complete only after that tick,
+	// so this wait is already satisfied and only orders the memory across the two queues.
+	if (render != nullptr && render_tick != 0) {
+		submit.AddWait(render, render_tick, vk::PipelineStageFlagBits::eAllCommands);
+	}
 	submit.AddSignal(m_render_complete[m_image_index]);
 	const auto tick                       = scheduler.Submit(submit);
 	m_image_acquired_ticks[m_frame_index] = tick;
@@ -953,8 +965,9 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	{
-		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
-		result = m_window.graphic_ctx.queue.presentKHR(&present);
+		// May block in the kernel; only the presenter's own queue is held meanwhile.
+		Common::LockGuard lock(m_window.graphic_ctx.PresentQueueMutex());
+		result = m_window.graphic_ctx.PresentQueue().presentKHR(&present);
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;
@@ -1227,6 +1240,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	frame->render_tick = m_impl->renderer.GetCommandScheduler().CurrentTick();
 	RecordScreenshot(buffer, *frame, m_impl->window.graphic_ctx);
 	if (headset) {
 		// The frame holds the raw display-encoded pixels the headset needs.
@@ -1247,9 +1261,11 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
+	frame->render_tick = 0;
 	if (producer != nullptr) {
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
+		frame->render_tick = m_impl->renderer.GetCommandScheduler().CurrentTick();
 	} else {
 		Common::LockGuard lock(m_impl->present_mutex);
 		auto& command = m_impl->present_scheduler.BeginCommand();
@@ -1342,7 +1358,25 @@ void Presenter::Impl::Present() {
 		                                 swapchain.PrepareSystemOverlay();
 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 		                                draw_system_overlay);
-		const auto tick = swapchain.Submit(present_scheduler);
+		uint64_t render_tick = 0;
+		for (const auto& layer: layers) {
+			if (layer.frame != nullptr) render_tick = std::max(render_tick, layer.frame->render_tick);
+		}
+		{
+			// Never submit a wait-before-signal on the render timeline: with asynchronous
+			// recording a tick handed to the worker may not be submitted yet, and the NVIDIA
+			// driver blocks such a submit holding its device lock (MasterSemaphore::WaitSubmitted).
+			// A tick the GPU thread is still recording is left as before (the GPU thread may
+			// itself wait for this presenter).
+			auto& render_scheduler = renderer.GetCommandScheduler();
+			auto& master = render_scheduler.GetMasterSemaphore();
+			if (render_tick != 0 && render_tick < render_scheduler.CurrentTick() &&
+			    master.SubmittedTick() < render_tick) {
+					master.WaitSubmitted(render_tick);
+			}
+		}
+		const auto tick = swapchain.Submit(
+		    present_scheduler, renderer.GetCommandScheduler().GetMasterSemaphore().Handle(), render_tick);
 		for (const auto& layer: layers) {
 			if (layer.frame != nullptr) {
 				layer.frame->present_tick = tick;

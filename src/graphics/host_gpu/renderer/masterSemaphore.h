@@ -28,6 +28,24 @@ public:
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
+	// Ticks whose vkQueueSubmit has returned (asynchronous recording hands ticks to a worker that
+	// submits later). A submit on another queue that waits on this timeline must wait for its tick
+	// to be submitted first: the NVIDIA driver blocks a wait-before-signal submit while holding
+	// its device lock, and the worker then cannot submit the signal (gsamp-2 hang, 2026-11-07).
+	[[nodiscard]] uint64_t SubmittedTick() const noexcept {
+		return m_submitted_tick.load(std::memory_order_acquire);
+	}
+	void MarkSubmitted(uint64_t tick) noexcept {
+		m_submitted_tick.store(tick, std::memory_order_release);
+		m_submitted_tick.notify_all();
+	}
+	// Blocks until `tick` was submitted. Only for ticks already handed to the submitter.
+	void WaitSubmitted(uint64_t tick) const noexcept {
+		for (auto current = SubmittedTick(); current < tick; current = SubmittedTick()) {
+			m_submitted_tick.wait(current, std::memory_order_acquire);
+		}
+	}
+
 	void Refresh();
 	void Wait(uint64_t tick);
 
@@ -36,6 +54,7 @@ private:
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	std::atomic<uint64_t> m_submitted_tick {0};
 };
 
 } // namespace Libs::Graphics

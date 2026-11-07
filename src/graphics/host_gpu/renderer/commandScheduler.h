@@ -22,7 +22,8 @@ extern std::atomic<uint32_t> g_submit_probe;
 class CommandScheduler {
 public:
 	// allow_async: this scheduler may record through a worker thread (KYTY_ASYNC_RECORD).
-	CommandScheduler(RenderContext& context, GraphicContext& graphics, bool allow_async = false);
+	CommandScheduler(RenderContext& context, GraphicContext& graphics, bool allow_async = false,
+	                 bool present = false);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -46,6 +47,8 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
+	// Tick of the newest queued or running priority operation; 0 when there is none.
+	[[nodiscard]] uint64_t    LatestPendingPriorityTick();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -109,6 +112,8 @@ private:
 	CommandBuffer                m_command;
 	// Destroyed before the pool: its worker uses the pool and the queue.
 	std::unique_ptr<CommandRecorder> m_recorder;
+	// Immediate submissions go to GraphicContext::PresentQueue() (the presenter).
+	bool                             m_present = false;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;

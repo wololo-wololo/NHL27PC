@@ -660,6 +660,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+		Common::DebugCounters::t_host_exceptions++;
+		// A walker on an asynchronous-materialization helper never reads back or downloads: the
+		// walk is marked aborted and redone on the GPU thread.
+		if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerHelperAbort(
+		        info->exception_address)) {
+			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
+			return true;
+		}
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;

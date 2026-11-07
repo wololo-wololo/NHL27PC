@@ -416,6 +416,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Common::ThreadSampler::SetCurrentThreadDescription("emu:Thread_Gpu");
 	Common::ThreadSampler::RegisterCurrentThreadFromEnvironment("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
@@ -520,6 +521,11 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 
 	cp.BufferInit();
+	if (submission.type == SubmissionType::Graphics || submission.type == SubmissionType::Compute) {
+		// Every slice: a command buffer paused on a CPU-written label may resume reading data
+		// the CPU wrote meanwhile.
+		m_renderer.PrepareBdaForSubmission();
+	}
 	bool complete = true;
 
 	switch (submission.type) {

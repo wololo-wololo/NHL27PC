@@ -135,6 +135,7 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread only: whether any byte of the range holds GPU-written data not yet read back.
 bool                   HasGpuDirtyBufferBytes(uint64_t vaddr, uint64_t size);
+bool                   OverlapsPrtAperture(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

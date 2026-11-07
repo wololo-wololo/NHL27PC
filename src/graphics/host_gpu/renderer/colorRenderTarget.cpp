@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -18,6 +19,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -49,6 +52,57 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
 	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
+
+	// The description below depends only on these registers and arguments; most draws repeat the
+	// previous draw's. Reuse it and only look the image up again (the cache may have changed).
+	// KYTY_RT_MEMO=0 disables; it follows KYTY_AB_PERIOD.
+	struct Memo {
+		bool                                         valid = false;
+		std::array<uint8_t, sizeof(HW::RenderTarget)> regs {};
+		uint32_t                                     mask = 0, slice_offset = 0;
+		bool                                         ignore = false, exact = false;
+		RenderColorInfo                              result;
+	};
+	static thread_local std::array<Memo, 8> memos;
+	static const bool memo_enabled = [] {
+		const char* value = std::getenv("KYTY_RT_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	std::array<uint8_t, sizeof(HW::RenderTarget)> regs {};
+	std::memcpy(regs.data(), &rt, sizeof(rt));
+	const auto raw_mask = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
+	if (memo_enabled && Common::DebugCounters::AbVariant() && rt_slot < memos.size()) {
+		auto& memo = memos[rt_slot];
+		if (memo.valid && memo.mask == raw_mask && memo.slice_offset == render_target_slice_offset &&
+		    memo.ignore == ignore_target_mask && memo.exact == exact_format && memo.regs == regs) {
+			auto& cache = m_context.GetTextureCache();
+			r                     = memo.result;
+			r.image_id            = cache.FindImage(r.desc, exact_format);
+			BindRenderTarget(r.image_id);
+			return;
+		}
+	}
+	struct Store {
+		RenderColorInfo& r;
+		const std::array<uint8_t, sizeof(HW::RenderTarget)>& regs;
+		uint32_t mask, slice_offset, slot;
+		bool ignore, exact, enabled;
+		RenderColorInfo before_lookup;
+		bool resolved = false;
+		~Store() {
+			if (!enabled || slot >= memos.size()) return;
+			auto& memo = memos[slot];
+			memo.valid          = resolved;
+			if (!resolved) return;
+			memo.regs = regs;
+			memo.mask = mask;
+			memo.slice_offset = slice_offset;
+			memo.ignore = ignore;
+			memo.exact = exact;
+			memo.result = before_lookup;
+		}
+	} store {r, regs, raw_mask, render_target_slice_offset, rt_slot, ignore_target_mask, exact_format,
+	         memo_enabled && Common::DebugCounters::AbVariant()};
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
 	}
@@ -265,8 +319,10 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	store.before_lookup        = r;
+	store.resolved             = true;
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 

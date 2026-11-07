@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
+#include "common/threadSampler.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
@@ -22,7 +23,9 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <ctime>
 #include <memory>
 #include <mutex>
@@ -3252,6 +3255,22 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Guest thread names in host tools (tools/perf/threads.ps1, debuggers, Nsight).
+	if (!thread->name.empty()) {
+		const std::string  name = "guest:" + thread->name.substr(0, 60);
+		std::wstring       wide(name.begin(), name.end());
+		SetThreadDescription(GetCurrentThread(), wide.c_str());
+		// KYTY_SAMPLE_GUEST=<name>[,<name>...]: sample these guest threads like the GPU thread
+		// (same KYTY_SAMPLE_GPU window); reports land in thread-samples.txt.
+		if (const char* sample = std::getenv("KYTY_SAMPLE_GUEST"); sample != nullptr) {
+			const std::string list = std::string(",") + sample + ",";
+			if (list.find("," + thread->name + ",") != std::string::npos) {
+				Common::ThreadSampler::RegisterCurrentThreadFromEnvironment(thread->name.c_str(), true);
+			}
+		}
+	}
+#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)

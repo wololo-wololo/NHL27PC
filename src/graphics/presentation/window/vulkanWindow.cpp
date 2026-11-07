@@ -447,7 +447,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	// A second queue of the same family serves buffer readbacks whose GPU producer already
 	// finished, so they need not wait behind the main queue's backlog.
-	const float queue_priorities[2] = {1.0f, 1.0f};
+	const float queue_priorities[3] = {1.0f, 1.0f, 1.0f};
 	uint32_t    family_count        = 0;
 	physical_device.getQueueFamilyProperties(&family_count, nullptr);
 	std::vector<vk::QueueFamilyProperties> families(family_count);
@@ -460,9 +460,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 ? 2u
 	                                 : 1u;
 	graphics.readback_queue_available = queue_count == 2u;
+	// A third queue for presentation (KYTY_PRESENT_QUEUE=0 presents on the main queue).
+	const char* present_env = std::getenv("KYTY_PRESENT_QUEUE");
+	const bool  present_own = (present_env == nullptr || present_env[0] != '0') && queue_count == 2u &&
+	                         families[queue_family].queueCount >= 3;
+	const uint32_t created_queues = present_own ? 3u : queue_count;
+	graphics.present_queue_requested = present_own;
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = queue_count;
+	queue_create_info.queueCount       = created_queues;
 	queue_create_info.pQueuePriorities = queue_priorities;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
@@ -1150,6 +1156,17 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		if (HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+			vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host_properties {};
+			vk::PhysicalDeviceProperties2                     properties2 {};
+			properties2.pNext = &host_properties;
+			graphic_ctx.physical_device.getProperties2(&properties2);
+			graphic_ctx.host_import_enabled   = true;
+			graphic_ctx.host_import_alignment = host_properties.minImportedHostPointerAlignment;
+			std::printf("GPU: host-pointer import available (alignment 0x%llx)\n",
+			            static_cast<unsigned long long>(graphic_ctx.host_import_alignment));
+		}
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
@@ -1196,6 +1213,10 @@ void WindowContext::CreateVulkan() {
 	if (graphic_ctx.readback_queue_available) {
 		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
 	}
+	if (graphic_ctx.present_queue_requested) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 2, &graphic_ctx.present_queue);
+		std::printf("GPU: presenting on a separate queue\n");
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1240,6 +1261,7 @@ WindowContext::~WindowContext() {
 		graphic_ctx.device = nullptr;
 		graphic_ctx.queue  = nullptr;
 		graphic_ctx.readback_queue = nullptr;
+		graphic_ctx.present_queue  = nullptr;
 	}
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);

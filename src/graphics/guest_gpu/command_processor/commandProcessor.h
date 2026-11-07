@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <span>
 #include <string>

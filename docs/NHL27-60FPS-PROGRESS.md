@@ -1,8 +1,485 @@
 # NHL 27 PC — 60 FPS progress handoff
 
-Last updated: 2026-11-05 (Europe/Berlin)
+Last updated: 2026-11-07 (Europe/Berlin)
 
-## FPS work, 2026-11-05 late (newest; the crash hunt below is parked at 1 loss in 22 runs)
+## Session 2026-11-07, part 10: toward a steady 30
+
+The user chose "steady 30 first" after part 9.
+
+- **Where gameplay is below 30 (`asst-1..5`, per-second flips, tool `tools/perf/slowfast.py`):**
+  - The first ~25 s after `-SkipIntro 8` are still the **pre-game lineup presentation** (player
+    cards, arena lights; screenshot `gprof-slow/gameplay+15`) at 13–19 FPS with ~5,500–6,000
+    draws per frame. Not on-ice play; exclude it (process time < ~115 s) from gameplay numbers.
+  - On-ice play only (t 115–210, 475 s): mean 29.5, median 30, 25% of seconds below 28, 9% below
+    25. The dips come in 4–6 s bursts (one or two per run) at 3,500–5,000 draws per frame,
+    probably whistle/faceoff cameras. Per-draw cost is unchanged there; the draw count rises.
+  - Pipeline compiles (up to 1.6 s in one second) only on the first runs after a rebuild.
+- **Game-thread sampling (new `KYTY_SAMPLE_GUEST=<name>,…`, same window as `KYTY_SAMPLE_GPU`):**
+  `RenderLoop` 96% and `GameSimulationLoop` 99.9% waiting on semaphores fed by the `Job0..12`
+  workers; `GfxEopEventLoop` 94% waiting on EOP events. (`HalPs5 submit` is audio output.)
+  Queue submits are already fine-grained (~52 per frame). The GPU thread's ~9% idle is coupling:
+  job threads slowed by write faults and readbacks. No single cheap fix found there.
+  - Sampler changes: guest threads are unwound only inside the emulator image (ntdll's lookup of
+    code outside any module crashed the sampler, `gsamp-1`); reports append to
+    `thread-samples.txt` and are serialized (dbghelp is not thread-safe, `gsamp-3` crashed);
+    addresses outside any module are grouped as `[guest/jit code]`. Thread names come from the
+    game (`Pthread run begin:` lines in the guest log).
+- **Async-recording deadlock found and fixed (`gsamp-2`).** Hang during the load: the presenter
+  sat in `NtDxgkSubmitPresentToHwQueue` holding an NVIDIA driver lock, and the GPU thread (side-queue
+  readback submit) and the recorder worker (its `vkQueueSubmit`) both waited for that lock.
+  Cause: with async recording a tick "submitted" by the GPU thread is only handed to the worker,
+  so other queues' submits (side readback, presenter blit) could wait on timeline values not yet
+  submitted (wait-before-signal), which this driver blocks inside its lock.
+  - Fix: `MasterSemaphore::SubmittedTick/MarkSubmitted/WaitSubmitted` (the worker and the
+    immediate path mark ticks after `vkQueueSubmit` returns). `DownloadOnSideQueue` waits for its
+    tick to be submitted first; the presenter does too when its render tick was already handed
+    over (a tick still being recorded keeps the old behavior, since the GPU thread may wait for
+    the presenter).
+- **BDA sync per submission slice (on, `KYTY_BDA_SLICE_SYNC=0` disables, follows
+  `KYTY_AB_PERIOD`).** Before every DMA draw `PrepareBda` synced every buffer range the CPU had
+  written since the previous draw (58k write faults/s feed it): `BindBdaNs` ~79 ms/s. CPU-write
+  ranges (write faults, `ReadMemory` write path, new mappings) now go to a second queue
+  (`QueueBdaSyncCpu`) that is drained once per guest submission slice (`PrepareBdaForSubmission`,
+  from `GuestGpu::Process`). Per draw only newly registered buffers are synced. The guest can only
+  rely on CPU writes made before it submitted, or before a label the command buffer waits on,
+  which ends a slice.
+  - `bdas-1` in-run A/B: `BindBdaNs` 79.0 → 2.9 ms/s, `DrawFindBuffersNs` 201 → 134 ms/s, draws/s
+    62.2k → 66.1k with the GPU thread less busy (905 → 868 ms/s): ~+11% draws per GPU-thread ms.
+    Screenshots in both phases correct.
+- **Open: the end-of-session build measured slower, cause not found.** On-ice play only
+  (process time 115–210 s):
+
+  | Batch | Build | Mean | Median | p10 | Seconds < 25 | Device losses |
+  |---|---|---|---|---|---|---|
+  | `asst-1..5` | morning (async default) | 29.5 | 30 | 25 | 9% | 0/5 |
+  | `sl30-1..5` | + submit-ordering fix, slice sync, diagnostics | 27.8 | 29 | 19 | 22% | 1/5 |
+  | `nosl-1` | same, `KYTY_BDA_SLICE_SYNC=0` | 26.2 | 27 | 21 | 18% | 0/1 |
+
+  - Slice sync is not the cause (`nosl-1` is as slow). In `sl30` the GPU thread spends *less*
+    time in PM4 processing (849 vs 909 ms/s) with cheaper draws (7.9 vs 8.4 µs), so it is idle
+    or busy somewhere uncounted more often. Suspects: the new `WaitSubmitted` waits (presenter /
+    side readbacks now wait for the worker's `vkQueueSubmit`), batch-to-batch variance (late-night
+    runs), or the slice-start BDA sync, whose cost is outside `Pm4ProcessNs`.
+  - `sl30-5` lost the device with the long-standing signature (dispatch `0x0ab3a7c64ccce901`,
+    `streamBuffer.cpp:183` copies, 2348×1320 re-detiles in flight): the known ~1-in-5 class,
+    not new.
+- **Next steps, in order:**
+  1. Find the regression: add timers around `PrepareBdaForSubmission` (e.g. `BdaSliceSyncNs`) and
+     `WaitSubmitted` (count + ns, per caller), then run the current build and an `asst`-equivalent
+     build (git stash of today's later changes) back to back, 3 runs each. If `WaitSubmitted`
+     costs, wait only when the driver would really block (the hang needs the presenter or side
+     queue to submit a wait on an unsubmitted tick), e.g. have the worker do the side submit.
+  2. Keep slice sync if it is neutral or better once (1) is resolved (its A/B was a clear
+     per-draw win).
+  3. Then the steady-30 items: early copy-back of re-read GPU ranges (about half the readbacks
+     have a finished producer; needs the in-flight-copy coherence rules worked out in this
+     session: CPU reads/writes during the copy must wait for its publish, GC must skip pending
+     ranges), image reuse (~2%), and hot write-fault pages (careful: per-slice re-dirtying would
+     re-upload ring buffers bound in many slices; 64 KiB fault coalescing was reverted before for
+     texture re-uploads).
+  4. The draw-heavy whistle/faceoff bursts (3,500–5,000 draws per frame) stay below 30 until
+     per-draw cost roughly halves (part 9: pipeline/GPU-side descriptors).
+- New this session, all opt-in or diagnostic: `KYTY_SKIP_DRAWS`, `KYTY_SAMPLE_GUEST`,
+  `KYTY_IMAGE_SUBALLOC`, `tools/perf/slowfast.py`, thread descriptions for guest threads and the
+  GPU thread (the `threads.ps1` name column still comes back empty). Defaults changed: async
+  recording on (part 8), BDA slice sync on, submit-ordering fix (always on).
+
+## Session 2026-11-07, part 9: is 60 FPS reachable? (feasibility measurement)
+
+- **GPU-thread budget per frame (async default, `asst-3`, 28 flips/s, ~2,680 draws and ~1,030
+  dispatches per frame, ~32 ms of GPU-thread time per frame):** shader-resource materialization
+  (walk + decode, reads only guest memory) 264 ms/s = 9.4 ms/frame; buffer lookup/sync/bind
+  (`FindBuffers`) 202 = 7.2; dispatch processing 158 = 5.6; other PM4 (decode, registers,
+  readbacks, waits) ~148 = 5.3; render targets, images, commit, record ~120 = 4.3. A two-thread
+  pipeline that moves only the pure part (materialization) caps at ~1.4× (~39 FPS).
+- **New diagnostic `KYTY_SKIP_DRAWS=<percent>[,<delay s>]`** (`renderDraw.cpp`
+  `SkipDrawForDiagnostics`): drops that share of graphics draws (every Nth of 100) before any host
+  work, starting `<delay>` s after the first draw so the menus still render for the autopilot.
+  Counter `SkippedDraws`; the autopilot counts it toward its draws-per-flip gameplay test.
+  Rendering is garbage by design (the user saw it: noise, then nothing at 100%).
+- **Result (`gskip-0/50/100`, delay 85 s, averages over gameplay after the skip starts):**
+
+  | Draws skipped | Flips/s | GPU thread (`Pm4ProcessNs`) | Dispatch | Game-thread faults |
+  |---|---|---|---|---|
+  | 0% | 25.2 | 914 ms/s | 150 ms/s | 216 ms/s |
+  | 50% | 36.1 | 884 ms/s | 204 ms/s | 333 ms/s |
+  | 100% | **52.0** | 858 ms/s | 270 ms/s | 404 ms/s |
+
+  - FPS scales with draw cost, and the **game's own threads run at ≥52 FPS**: per-thread CPU
+    (`threads.ps1`) shows no saturated game thread (busiest non-GPU thread 31% of a core at
+    25 FPS, 42% at 52 FPS; process ~3.7 of 16 hardware threads).
+  - Even with zero draws the GPU thread is still saturated at 52 FPS: dispatches 270 ms/s,
+    GPU-thread readbacks (`SideReadbackNs` 108 + `GpuThreadReadbackNs` 62), GPU waits 186 ms/s,
+    materialization for dispatches 114 ms/s. Game threads stall 283 ms/s in readbacks
+    (`BufferReadSyncNs`) of GPU-written data.
+- **Verdict:** 60 is not ruled out by the game itself, but it needs more than the draw path. At 60
+  the GPU thread has 16.7 ms per frame; today draws cost ~22 ms/frame and the non-draw work
+  (dispatches, readbacks, PM4) ~10 ms/frame, which scales to ~16 ms/frame at 52 FPS by itself.
+  The GPU is also at its limit (16.5 ms/frame). So 60 needs draws to drop to a few ms per frame
+  (GPU-side descriptors and/or parallel draw preparation), plus dispatch and readback costs roughly
+  halved, plus some GPU trimming. Each is a multi-week item; together a multi-month effort with
+  real risk. A steady 30 is near (25–28 today), and ~40 looks reachable with a draw-preparation
+  pipeline.
+- `threads.ps1` now asks for thread descriptions (guest threads are named `guest:<name>` and the
+  GPU thread `emu:Thread_Gpu` via `SetThreadDescription`), but the name column came back empty in
+  these runs. Not yet debugged.
+
+## Session 2026-11-06/07, part 8: async recording is the default, blocked-time map
+
+The user chose this route over more host-mirror debugging (part 7).
+
+- **Async Vulkan recording is now on by default** (`KYTY_ASYNC_RECORD=0` restores immediate
+  recording). Same build, 150 s of on-ice play per run, `hang-repro.ps1`:
+
+  | Mode | Runs | Device losses / hangs | Flips/s per run | Mean |
+  |---|---|---|---|---|
+  | async (`asst-1..5`) | 5 | 0 / 0 | 27.6, 27.0, 28.0, 25.9, 28.0 | **27.3** |
+  | immediate (`imst-1..5`) | 5 | 0 / 0 | 24.5, 25.7, 26.0, 25.2, 24.8 | **25.2** |
+
+  Async also does ~8% more draws/s (72.9k vs 67.4k). Default re-checked with no `KYTY_*`
+  variables (`adef-1`): recorder active, 25.9 flips/s with the sampler on, gameplay screenshots
+  correct, no loss. (Flips/s here is `FlipsRequested` over gameplay minus the first 15 s; it
+  reads higher than the ~21 FPS of earlier sections, so compare within this table only.)
+- **Where the GPU thread waits now (async, `asyb-1`, `KYTY_WAIT_STACKS=90`):** ~21% of samples
+  blocked:
+  - ~8.8% idle in `GuestGpu::ThreadRun` (no work from the game) and 3.7% in `WaitFlipDone`, so
+    with async recording the game's own threads and flip pacing start to show.
+  - ~8% side-queue readbacks (`DownloadOnSideQueue`), mostly walker loads faulting on GPU-written
+    pages (`HandleFault` → `ReadMemory`), plus some from `DrawIndex`. Per second: 36 read
+    readbacks (19 with the producer already **complete**, 9 in flight, 8 unknown), 28 write-fault
+    downloads (all complete), 100 side readbacks costing 76 ms (~0.76 ms each, ~230 KB each from
+    the widened coalescing window; 23 MB/s read + 44 MB/s write-fault downloads). Most cost is
+    the fixed submit + fence round trip, not waiting for unfinished GPU work.
+  - Image write-back drains are small now (7/s `TextureWriteFaultDownloads`).
+- **Other GPU-thread costs seen:** re-protection after uploads (`NtProtectVirtualMemory` 3.7%,
+  68k protect calls/s) as the other half of **58k guest write faults/s (233 ms/s, on the game
+  threads)**: game writes a tracked buffer page, the GPU thread uploads it and re-protects it, and
+  the game faults again next frame. Image create/destroy churn: ~110–120 images/s,
+  create + delete ~18 ms/s.
+- **Tried: image suballocation (`KYTY_IMAGE_SUBALLOC=1`, opt-in, follows `KYTY_AB_PERIOD`).**
+  NVIDIA reports `prefersDedicatedAllocation` for render targets, so VMA gave each its own
+  `VkDeviceMemory`. With the hint ignored (requirements queried without the dedicated chain,
+  `vmaAllocateMemory` + `vmaBindImageMemory`): `isub-1` in-run A/B, create+delete 18.8 → 16.8 ms/s,
+  rendering correct. The `vkCreateImage`/`vkDestroyImage` calls dominate, not the memory. Gain
+  within noise, so it stays opt-in. New counters `ImageCreates/ImageCreateNs/ImageDeletes/
+  ImageDeleteNs`.
+- **Next candidates, by expected gain:**
+  1. Readbacks whose producer is already complete (~half of them): publish GPU-written ranges
+     eagerly for ranges the CPU has read back before. At the end of the producing command buffer,
+     copy them into the download ring, then `WriteBacking` plus clear GPU-modified in a priority
+     op once the tick completes, so the later CPU read finds clean memory and no fault. Up to
+     ~7% of the GPU thread.
+  2. Hot write-fault pages: pages the game rewrites every frame could stay unprotected and be
+     uploaded on every use (treated as always CPU-dirty) after N consecutive-frame faults, and
+     demoted again when the GPU writes them. Removes fault cost on the game threads and
+     re-protection on the GPU thread (~4%).
+  3. Image churn (~2%): recycle host images by create info instead of destroying them.
+
+## Session 2026-11-06, part 7: host-mirror crash hunt
+
+- **Bug found and fixed: `ApplyMirror` released imports mid-draw.** With only
+  `KYTY_GPU_HOST_MIRROR=1` (no `KYTY_GPU_MIRROR`), `ApplyMirror` runs from `PrepareBda()` inside
+  draw/dispatch preparation (after `FindBuffers`, inside an open upload batch). The
+  release-before-reimport added for hmir-2 called `ReleaseHostImports` → `m_scheduler.Finish()`
+  there: the known "submit mid-command, rest of the command never runs" failure, which fits the
+  garbage guest reads of hmir-2..4. Every Windows remap path already calls `UnmapGpuRange` first
+  (`ReplaceFixedRangeWithReserved`, the reserved-target paths), which releases imports between
+  commands (`UnmapMemory` → `UnmapMirror`). `ApplyMirror` now imports only the gaps between
+  existing imports and never releases.
+- `hmir-5` (fix, promotion on, cold cache): menus fine (past the old menu crash), then a guest
+  crash during the load into the arena (`Job6` walking a list into a null node: guest data
+  corruption again). Shaders only *read* through BDA (`LoadBdaDword`, BVH), so GPU stores into
+  imports are ruled out.
+- New diagnostic `KYTY_GPU_HOST_MIRROR_PROMOTE=0`: tagged (mirror-only) fault pages are not turned
+  into device buffers (`BufferCache::SkipHostMirrorPromotion`, `FaultManager`).
+- `hmir-6` (promotion off): no guest crash, but a device loss during the load with the
+  long-standing default-path signature (re-detiles `image.cpp:310` / `tiler.cpp:294/326` in
+  flight; the game's own breadcrumbs stop in `forwardSimpleOpaque`).
+- **Repeats: the host mirror is unstable regardless of promotion.** `hmnp-1..3` (promotion off):
+  guest crash in `Job6` at the main menu (`hmnp-1`), device losses after reaching gameplay
+  (`hmnp-2`, t≈97) and in the load (`hmnp-3`). `hmpr-1..3` (promotion on): device losses in
+  all three (two after reaching gameplay, one in the load). 6/6 failed, vs ~1/5 losses by default.
+  So promotion is not the corruption source.
+- **Aliasing ruled out by a standalone test** (scratch `importtest.cpp`: pagefile section
+  `PAGE_EXECUTE_READWRITE | SEC_COMMIT`, whole-range alias view plus a second view, 8 MiB of the
+  view imported on the 5090): alias↔view coherence holds after import, under
+  `VirtualProtect` read-only/read-write, for a GPU `vkCmdFillBuffer` into the import, after
+  `vkFreeMemory`, and when the view is unmapped and remapped at the same address while an import is
+  alive. 0 mismatches.
+- **Remaining suspect (not proven):** with the mirror, DMA reads return real host bytes instead of
+  zero, and those bytes are stale wherever the newest data is GPU-only (host images of the texture
+  cache: render targets / storage images in guest memory, never written back). The default path
+  reads zero for one frame, then `FindBuffer` syncs the page. Shaders computing from stale inputs
+  write garbage into bound storage buffers, which the normal download path hands to the CPU (fits
+  `Job6` crashes and garbage-count GPU hangs). Test: never tag (write no fallback entry for)
+  pages that overlap a registered texture-cache image, and see if the losses go away.
+- All of this is opt-in; the default path has no codegen or behavior change from part 7.
+
+## Session 2026-11-06, part 6: host-memory mirror (opt-in `KYTY_GPU_HOST_MIRROR=1`, unstable)
+
+- Direct-memory mappings are imported zero-copy (`VK_EXT_external_memory_host`, enabled when
+  offered, alignment 0x1000 on the 5090; `BufferCache::ImportHostRange`). BDA page-table entries
+  no device buffer owns point into the import with bit 0 set (`WriteFallbackEntries`,
+  `FallbackAddress`; restored on `Unregister`). `get_bda_pointer` now reads through tagged
+  entries and records the page in the fault buffer, so the CPU promotes it to a device buffer
+  (working set). This codegen change applies to all DMA shaders; default path re-checked
+  (`dsan-4`, cold cache, reached gameplay).
+- `hmir-1` (before tags/promotion): 7.45 GiB imported, some imports fail on remapped ranges,
+  10.8 FPS (pages never promoted, so DMA reads stayed on PCIe), device loss at t≈109.
+- `hmir-2..4` (tags + release-before-reimport): the game itself crashed in the menus (guest reads
+  at `0x136e851ffe`, `0xff`). Suspect: freeing imported host memory disturbs the emulator's guest
+  memory views. Next: drop release-on-remap again, find which mapping paths remap without
+  `UnmapGpuRange`, and test import/free of a guest view in isolation.
+- `dsan-7` (default, warm): autopilot stopped at an unrecognized menu screen (menus 30 FPS);
+  re-run to confirm gameplay FPS.
+
+## Session 2026-11-06, part 5: full guest-memory mirror (built, opt-in, not viable as is)
+
+- **What it does (`KYTY_GPU_MIRROR=1`, implied by `KYTY_GPU_BUFFER_DESCRIPTORS=1`):** every
+  *direct-memory* mapping (`MapDirectMemory` ×2, `KernelMemoryPoolCommit`: `MapGpuRange(...,
+  true)` → `RenderContext::MapMemory(..., mirror)`) is queued (`BufferCache::QueueMirror`) and
+  mirrored on the GPU thread (`ApplyMirror`: `FindBuffer` over the mapping, buffer `pinned`,
+  so the GC skips it and merged buffers inherit the pin; `UnmapMirror` unpins on unmap). The
+  BDA page table then covers all of it.
+  - Flexible memory is excluded: mirroring it write-protected guest thread stacks (flexible
+    `0x7ebad8000…`), and the process died silently (fault inside fault handling). PRT apertures
+    are excluded too (`LibKernel::Memory::OverlapsPrtAperture`).
+  - With the mirror, CPU writes reach it once per guest submission slice
+    (`RenderContext::PrepareBdaForSubmission`, from `GuestGpu::Process`) instead of before
+    every DMA draw (per-draw sync re-armed write protection ~2,800×/frame: 1–2 FPS, `mir-9`).
+- **Result: correct coverage, unplayable cost** (`mirs-1`): ~2 FPS. The GPU thread idles
+  (220 ms/s); game threads drown in write faults (1.15 s/s of fault handling, 584 ms/s of
+  protection changes), 146k uploads/s = **1.3 GB/s** of CPU-written direct memory, plus
+  ~37 MB/s of new mappings. NHL 27 streams far more data through GPU-visible memory than it ever
+  reads as buffers (textures/assets go through it), and a fully write-tracked mirror turns all of
+  it into fault + upload work. ~12.75 GiB gets mapped GPU-visible during a boot into gameplay.
+- **Diagnostics added:** `KYTY_GPU_MIRROR_TRACE=1` (mapped-size steps, mirror ranges, big BDA
+  syncs and upload reads); a last-chance unhandled-exception filter that prints code, address
+  and an unwound stack (`Common::ThreadSampler::PrintContextStack`; it did not fire for the
+  stack-protection crash, which never reaches it).
+- **Design the data points to instead (not built):** keep page-table coverage, drop eager
+  content sync. Sync only a *learned working set*: shaders reading through the page table
+  record the pages they touch (like the fault buffer), and at each submission the CPU uploads
+  the CPU-dirty pages of that set (plus first-touch faults). Write tracking stays limited to
+  memory the GPU actually reads, as today. Risk: first touches of fresh pages read zero for one
+  frame, which with garbage-bounded loops can hang the GPU, so it needs the loop watchdog (and
+  that needs compile-friendly codegen first).
+- Default path re-checked: `dsan-2` 21.6 FPS.
+
+## Session 2026-11-06, part 4: GPU-side descriptors, milestone 1 prototype
+
+The route chosen for 60 FPS: the GPU resolves guest descriptors itself, so the host stops
+walking, decoding, specializing and binding them per draw.
+
+- **Existing foundation (shadPS4 design, already in the tree):** a GPU page table maps guest
+  pages to host buffer device addresses (`get_bda_pointer` in `spirvEmitterMemory.cpp`,
+  `BufferCache::CACHING_PAGEBITS` pages); pages without an entry read zero and are recorded in a
+  fault buffer that the CPU processes later (`ProcessFaultBuffer`). `ResourceKind::IndirectBuffer`
+  loads decode the V# in the shader (`PrepareIndirectBuffer`, `LoadIndirectScalarBuffer`). Today
+  it is used only where the walker cannot resolve a descriptor.
+- **Prototype (opt-in `KYTY_GPU_BUFFER_DESCRIPTORS=1`, `ResourceTracking.cpp` `Collect`):**
+  every read-only buffer load the indirect path supports (scalar constant loads, raw 8/16/32-bit,
+  formatted X) is forced to `IndirectBuffer` even when the walker could resolve it. Stores and
+  atomics keep descriptors (write tracking unchanged). The shader store header now records the
+  codegen switches (`KYTY_GPU_BUFFER_DESCRIPTORS`, `KYTY_LOOP_WATCHDOG`), so a store written
+  under other settings is never reused.
+- **Result: not usable yet, two blockers** (`gbd-1..18`):
+  1. **Compile time.** Each scalar load becomes two nested conditional branches plus a
+     page-table call; big shaders get hundreds of them and single compute pipelines took up to
+     9.3 s to compile, past the game's ~5 s GPU watchdog. After ~15 warm-up runs the store
+     covered boot and the stalls stopped (0 slow pipelines).
+  2. **Coverage.** Then every run lost the device ~15 s into boot (or aborted on a zeroed
+     render-target format): the page table only covers memory the buffer cache already turned
+     into host buffers (at bind time). With all constant reads going through it, shaders read
+     zeros for a frame and garbage-bounded loops hang the GPU.
+- **Milestone plan from here:**
+  1. **Full guest-memory mirror:** back every GPU-visible guest mapping with host buffers and
+     page-table entries when it is mapped (`RenderContext::MapMemory`), with CPU-write sync and
+     GPU-write tracking at page level for the whole mirror instead of per bound buffer. Then GPU
+     reads never see unmapped pages.
+  2. **Branch-light in-shader decode:** one selection per load at most (bounds and page presence
+     folded into one predicate, fault recording kept in `get_bda_pointer`), V# fields decoded
+     once per handle, so NVIDIA compile times stay in the millisecond range. Measure GPU cost
+     (the GPU has ~0.2 ms of headroom per frame at 60).
+  3. Re-enable milestone 1 on that base; measure walker/binding time saved per draw.
+  4. Images: a bindless table of host image views plus a GPU-visible guest-address → view lookup;
+     the CPU keeps creating/uploading images from a per-frame "referenced images" scan, which is
+     the hard part (the texture cache must still learn which images a draw samples).
+- Default path re-checked after the store reset: `dsan-1` 21.1 FPS, no issues.
+
+## Session 2026-11-06, part 3: multi-threaded draw preparation, step 1
+
+- **Asynchronous pixel-shader materialization (built, exact, opt-in `KYTY_ASYNC_MATERIALIZE=1`).**
+  - Per draw, the pixel stage's materialization (SRT walk, descriptor decode, specialization)
+    is posted to a spinning helper thread, the vertex stage is materialized on the GPU thread
+    meanwhile (`MaterializeAhead`), and both lookups then only match modules
+    (`Program::materialized_ahead`; `Program::Materialize` split out of `FindModule`).
+  - Only plans whose materialization reads nothing but walked guest memory qualify
+    (`HelperEligible`: no indirect descriptors, captured/source reads or selector keys). A
+    walker load that faults on the helper never touches the buffer cache: the exception handler
+    skips it and marks the walk aborted (`SrtWalkerHelperAbort`), and the GPU thread redoes it.
+  - `KYTY_ASYNC_MATERIALIZE_VERIFY=1` recomputes every helper result on the GPU thread:
+    `amv1`, **3.1 M checks, 0 mismatches**. ~60% of draws qualify (34k posts/s), ~6/s abort.
+  - **No FPS gain** (`amab1`, in-run A/B, 105 s): 20.4 vs 20.5 FPS. The GPU thread saved
+    ~31 ms/s of materialization but waited 15 ms/s for the helper, and its draw execution and
+    dispatches got 7–10 ms/s slower while the helper spun (8 cores / 16 threads, 9800X3D, the
+    game's own threads also busy). Total walk work did not shrink (173 vs 181 ms/s).
+  - Lesson: overlapping stages *within* a draw saves well under 1 µs per draw and costs a core.
+    Multi-threading only pays with larger independent chunks (whole draws or command buffers),
+    which the shared caches (buffer/texture cache, page protection) do not allow today.
+- The render-target description memo (`KYTY_RT_MEMO`, on) showed in the same A/B: render-target
+  resolve 63 → 47 ms/s (~0.3 µs per draw).
+- **Where this leaves 60 FPS:** the GPU now fits (16.5 ms/frame), the GPU thread needs ~45 ms of
+  CPU per frame. Per-draw cost is spread over walks (~3.4 µs), bindings (~3 µs), state prep,
+  commit and record. Realistic routes, each multi-week: (1) GPU-side descriptor resolution
+  (bindless host images + a GPU-visible guest-address → descriptor table, so the host stops
+  walking and materializing per draw); (2) making the buffer/texture caches and page tracking
+  thread-safe so whole command buffers can be prepared on several threads. Incremental
+  single-thread work is unlikely to go much past ~25–30 FPS.
+
+## Session 2026-11-06, part 2: GPU budget, relaxed barriers on, device-loss class
+
+- **GPU side measured (`gpu1`, `KYTY_GPU_TIMING=1`): 26.3 ms of GPU work per frame** (500 ms/s
+  at 19 FPS). With infinite CPU that alone capped the game at ~38 FPS.
+  - The largest block: a chain of ~11 small compute shaders, each ~36×/frame with 1–18
+    workgroups (`0xae45…`, `0x067f…`, `0xcbc6…`, `0x4b38…`, `0x84af…`, `0x9608…`, …, ~130 ms/s
+    in the serialized profile `gprof4`), latency-bound behind the full barrier after every
+    dispatch.
+- **Relaxed compute barriers are now on by default** (`KYTY_RELAXED_CS_BARRIERS=0` restores the
+  barrier after every dispatch). GPU work per frame **26.3 → 16.5 ms** (`gpurel1`, 12–14k
+  barriers/s elided), i.e. the GPU now fits a 60 FPS frame.
+  - `rel-long1`: 320 s of play, 10 screenshots through the 1st period (clock 17:52 → 1:40), no
+    ice corruption (the old blotches predate later fixes). 23.3 FPS average.
+  - FPS barely moves (`dfr-1..5`: 21.3 / 21.7 / 21.6 / lost / 20.6), because the GPU thread's
+    CPU work (~45 ms per frame) is the bottleneck. The GPU headroom pays off once that shrinks.
+  - Stability `dfr-1..5`: 1/5 device losses (`dfr-4`, the old `0x0ab3a7c64ccce901` /
+    `streamBuffer.cpp:183` signature), 0 hangs — same rate as before (`dfv-1..5`).
+- **Device-loss class identified (not yet removed).** A full-marker capture (`dl-5`,
+  `KYTY_GPU_CHECKPOINTS=1`, mask 15, top-only, bottom every 8; 1 loss in 5 runs) stopped inside
+  dispatch `0x005236bd38db99ab`, whose inner loop walks an adjacency list
+  `for (i = 0; i < count; ++i)` with `count` loaded from a buffer filled by the previous dispatch
+  `0xa0b8d0d17425cdbd` (atomic counters, capped at 1024). Same class as every earlier analysis:
+  a shader looping on a garbage count (light-tile count, indirect instance count) until the TDR.
+  How the garbage arises is still open (timing-sensitive: markers mostly hide it).
+- **Loop watchdog built, opt-in (`KYTY_LOOP_WATCHDOG=1`, needs a cleared `_PipelineCache`).**
+  Every invocation gets a 2^22-iteration budget, ticked in each loop header; any branch with an
+  edge to a loop's merge block takes it once the budget is spent (in structured SPIR-V those are
+  exactly the loop's exits, so the merge phis stay valid; `LoopWatchdogsEmitted/Loops` count
+  coverage). Valid SPIR-V, but **cold NVIDIA compiles of guarded compute pipelines took 1–8+ s
+  each** (`Slow pipeline:` console lines, `wdog*`/`warm-*`), and several in a row stall the GPU
+  thread past the game's own ~5 s GPU watchdog, which core-dumps (`Coredump` stub flood after
+  "GPU Stopped Working" with `GfxEopQueue` stalls). Not shippable until it compiles fast (try a
+  per-loop SSA counter instead of a Function variable, or guarding only loops whose bound is
+  loaded from memory).
+- **Cold-cache stalls kill the game.** Today's earlier "menu hangs" (`walk1`, `winl1`, every
+  `wdog*`/`warm-*` run) were all the GPU thread inside `nvgpucomp64` compiling one pipeline for
+  more than 8 s. The shader store is keyed by the exe's write time (`BuildStamp`), so every
+  rebuild recompiles; the driver cache was saved only every 5 min, so crashing runs kept
+  nothing. It now saves every 30 s when dirty. After a rebuild expect 1–2 slow first runs.
+- **New:** `Slow pipeline:` console lines (>500 ms creates), render-target description memo
+  (`KYTY_RT_MEMO=0` disables; A/B not yet conclusive), lldb dumps 64 frames deep.
+- **What 60 FPS still needs:** the GPU now fits (16.5 ms). The GPU thread's CPU work must go from
+  ~45 to under 16 ms per frame (~2,800 draws × ~10.5 µs + ~1,000 dispatches): per-draw cost to
+  ~3–4 µs, which single-threaded micro-optimization will not reach. Needed: splitting draw
+  preparation over threads (e.g. SRT walks/materialization on helpers; they are ~3.5 µs/draw and
+  read only guest memory) or GPU-side descriptor resolution; plus removing the device-loss class
+  so async recording (driver off the thread, +8%) can become the default.
+
+## Session 2026-11-06 (part 1): SRT walker, async-recording stability, present queue
+
+Where it stands: **gameplay ~20 FPS (immediate recording) / ~22 FPS (`KYTY_ASYNC_RECORD=1`)
+on ice, menus a steady 30** (dips only at load screens). 60 FPS is far off; see "What 30/60
+needs" at the end of this section. Runs now use `measure.ps1 -SkipIntro 8`, which skips the
+pre-game presentation (the crowd intro ran 9–12 FPS and polluted earlier gameplay averages).
+
+- **The SRT walker was ~25% of the GPU thread, invisible to the sampler.** New counter
+  `WalkSrtNs` (timer around the JIT walk in `WalkSrt`): 233 ms/s, ~1.7 µs per program lookup
+  (`asy4-1`). JIT code has no unwind data, so sampled stacks stopped there and the sampler
+  attributed only ~5% to materialization.
+  - `KYTY_WALK_STATS=<s>` prints, once, per-plan calls, ns/call, an immediate warm repeat
+    (ns with caches hot), repeat rates and code size. `KYTY_WALK_DUMP=<bytes>` /
+    `KYTY_WALK_DUMP_HASH=<hex,…>` print a walker's node composition (and write its code to
+    `walker-<hash>-<stage>.bin` next to the emulator; disassemble with `llvm-objcopy -I binary
+    -O elf64-x86-64` + `llvm-objdump -D`).
+  - Findings: 1,065 plans, top plan 3%. Walker code is 5–270 KB per shader. Repeats of the
+    same user data: ~0% (per-draw constants), so memoization cannot help. The dominant node is
+    `LoadAddressU32` with only user-data/constant arguments (a "leaf read"), emitted as a
+    19-instruction thunk plus a call/state check per use. About half the time is cache misses
+    on guest descriptor tables just written by game threads on other cores (warm repeat:
+    5.3 of 10.0 s).
+  - **Fix 1 (on, `KYTY_WALKER_INLINE_READS=0` disables): leaf reads used by exactly one root
+    fetch (flat read, descriptor word, output; never a block condition, which the
+    reachability pass can re-evaluate) are emitted inline at that fetch**, with the base kept in
+    r12 across consecutive reads (callee-saved; pushed/popped at the root exits) and constant
+    offsets folded. Root uses are counted per emitted fetch site (a flat slot listed by several
+    blocks is fetched once per block).
+  - **Fix 2 (on, `KYTY_WALKER_PREFETCH=0` disables): a prologue prefetches the lines of leaf
+    reads, only for walkers needing ≤32 prefetches** (offsets ≥32 B apart plus each run's last,
+    so every touched line holds one). Uncapped (up to 256) it made the big pixel-shader walkers
+    slower (`wpf2`).
+  - `KYTY_WALKER_VERIFY=1` compiles a reference walker without inlining for every plan and
+    compares flat reads, known descriptor words, activity, outputs and captured addresses on
+    every walk: `wver2`, 12.6 M walks, **0 mismatches** (`wver1` found the per-site counting
+    bug: extra captures only).
+  - Result: walker 1.59 → **1.30 µs per call (−19%)**, e.g. VS `0x8e46…` 703 → 353 ns, PS
+    `0xa9f1…` 11.1 → 6.8 µs (`wrep1` → `wpf3`). FPS effect is within run-to-run noise
+    (~4–5% of the GPU thread).
+  - Still slow: walkers with block control flow (VS `0xe352…` 2.5 µs, PS `0x860c…` 18 µs,
+    CS `0xe9d3…` 10 µs warm): the reachability pass and walker-load exceptions, not reads.
+- **Uncommitted write-back change from 2026-11-05 night caused device losses; reverted to
+  opt-in.** `PreserveGpuImagesForCpuWrite` letting the faulting thread wait
+  (`KYTY_IMAGE_WRITEBACK_CALLER_WAIT=1` now) lost the device in 3 of 5 async runs (`hrep-1..5`,
+  re-detiles in flight): while the caller waits, the GPU thread can render into the image again
+  before the caller marks it CPU-dirty, and the next use re-uploads stale memory over it.
+  Default (drain on the GPU thread) restored: `wbfix-1..5` (async) 0/5 losses.
+- **Hang with async recording found and fixed: a blocking present held the shared queue
+  mutex.** `hang-threads-wpf1.txt` (lldb, all threads): the presenter sat in
+  `vkQueuePresentKHR` → `NtDxgkSubmitPresentToHwQueue` holding `GraphicContext::queue_mutex`;
+  the recorder worker waited for that mutex to submit; the GPU thread waited on a side-queue
+  readback whose producer tick was in the worker's queue; the priority thread waited on the
+  same tick. Immediate mode has the same exposure (the GPU thread's own submits take that
+  mutex).
+  - **Fix (on, `KYTY_PRESENT_QUEUE=0` disables): the presenter has its own `VkQueue`** (third
+    queue of the graphics family, `GraphicContext::PresentQueue()` / `PresentQueueMutex()`):
+    its scheduler (`CommandScheduler(..., present=true)`) submits there and presents there. Its
+    blit waits on the rendering timeline at the frames' `render_tick` (already complete when a
+    flip is ready, since flips complete in a priority operation after the tick; the wait only
+    orders memory across the queues). Swapchain teardown and splash retirement wait on both
+    queues.
+  - Async recording itself: ~+8% (`cmp-imm` 20.2 vs `cmp-asy` 21.8 FPS, same build), but
+    `cmp-asy` lost the device (re-detiles of 2348×1320 images in flight, the known
+    stale-upload signature). **Async stays opt-in.**
+- **Diagnostics added:**
+  - `GpuThreadWaits/GpuThreadWaitNs` (semaphore waits made by the GPU thread; ~6–15 ms/s, so
+    the GPU thread rarely waits on the timeline itself), `GpuThreadSyncWaitNs` (priority-op
+    waits), `GpuThreadReadbackNs`, `MaterializeFault*`/`MaterializeCleanNs` (materializations
+    with/without walker exceptions: exceptions cost only ~22 ms/s).
+  - Sampler: samples blocked in a system call now scan the stack for return addresses into the
+    emulator (unwinding through ntdll crashed again, `asy3-1`), reported as `== wait sites ==`.
+  - `measure.ps1` always runs `hangwatch.ps1` (lldb stacks to `hang-threads-<Name>.txt`,
+    then closes the game) and accepts `-SkipIntro N`; `hang-repro.ps1` loops runs and counts
+    device losses and hangs.
+- **Where the GPU thread goes now (immediate, `prof-imm`, on ice ~20 FPS, ~2,800 draws and
+  ~1,000 dispatches per frame, ~10 µs per draw):** driver ~11%; blocked ~19% (side-queue
+  readbacks ~9%, idle waiting for the game ~6%, image write-back drain ~2.4%, `Finish` on guest
+  unmaps ~1%); SRT walker ~19%; the rest is spread over many functions under 3% each
+  (`FindImagesInRegion`, `NtProtectVirtualMemory`, buffer sync, bindings).
+- **Default config verified (`dfv-1..5`, `hang-repro.ps1`, 150 s of on-ice play each):**
+  gameplay 21.2 / 21.4 / 17.3 / 21.4 FPS, menus 30.0 in every run, 0 hangs.
+  - `dfv-3` lost the device with the long-standing signature (re-detiles of 2348×1320 images,
+    `image.cpp:310` / `tiler.cpp:294/326`, in flight; also in `fix3-6`, `grid2`, `chain3`,
+    `ret-8`, `wsk0`, `cmp-asy`, …). The system overlay's `CheckVulkanResult` is only its first
+    observer (ImGui's texture upload waits idle on the main queue).
+  - `dfv-4` aborted at boot (t≈11 s): `unsupported render-target format combination: layout=0
+    type=0 order=0` (`textureCommon.cpp:84`), seen once before (`cog1`). Not yet investigated.
+- **What 30/60 needs:** 30 FPS needs ~1.5× on the GPU thread, 60 FPS ~3× plus a GPU-side
+  cut. No single item left is large; the structural options remain GPU-side descriptor
+  resolution (removes walker, readbacks for descriptors, materialization) and splitting draw
+  processing over threads. Next cheap items: walker block-control-flow cost and walker-load
+  exceptions (an always-readable alias view for walker loads with a software dirty check),
+  the write-back drain, render-target re-resolve.
+
+## FPS work, 2026-11-05 late (the crash hunt below is parked at 1 loss in 22 runs)
 
 - **Jump-table shaders no longer use the dispatcher fallback (fix, in the tree).** Any shader
   with a resolved `S_SETPC_B64` jump table (a guest `switch`) was forced to the dispatcher

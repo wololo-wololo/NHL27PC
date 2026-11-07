@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <atomic>
 #include <array>
 #include <map>
 #include <mutex>
@@ -89,7 +90,33 @@ public:
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] RangeSet TakeBdaSync();
+	// CPU writes to guest memory (write faults, new mappings). With slice sync
+	// (BdaSliceSyncEnabled) they reach DMA shaders once per guest submission slice instead of
+	// before every DMA draw: the guest can only rely on writes made before it submitted (or before
+	// a label the command buffer waits on, which ends a slice).
+	void                   QueueBdaSyncCpu(uint64_t vaddr, uint64_t size);
+	// all: also take the CPU-write queue (slice start, or every draw without slice sync).
+	[[nodiscard]] RangeSet TakeBdaSync(bool all = true);
+	[[nodiscard]] static bool BdaSliceSyncEnabled();
+	// Guest-memory mirror (KYTY_GPU_MIRROR=1, implied by KYTY_GPU_BUFFER_DESCRIPTORS=1): every
+	// GPU-visible guest mapping gets pinned host buffers and BDA page-table entries, so shaders
+	// reading guest memory through the page table never meet an unmapped page. Mappings are
+	// queued from any thread and mirrored on the GPU thread (ApplyMirror, before BDA syncs).
+	[[nodiscard]] static bool MirrorEnabled();
+	void                      QueueMirror(uint64_t vaddr, uint64_t size);
+	void                      ApplyMirror();
+	// GPU thread: an unmapped range leaves the mirror (its buffers become evictable).
+	void                      UnmapMirror(uint64_t vaddr, uint64_t size);
+	// Host-memory mirror (KYTY_GPU_HOST_MIRROR=1, implied by KYTY_GPU_BUFFER_DESCRIPTORS=1):
+	// direct-memory mappings are imported zero-copy (VK_EXT_external_memory_host), and every BDA
+	// page-table entry no device buffer owns points into that import. GPU reads of such pages
+	// see the CPU's current bytes over PCIe: no uploads, no write tracking, no first-touch zeros.
+	// Pages a device buffer owns keep pointing at it (its data, GPU writes included, is newer).
+	[[nodiscard]] static bool HostMirrorEnabled();
+	[[nodiscard]] bool        HasHostImports(uint64_t vaddr, uint64_t size) const;
+	// A recorded fault page that only the host mirror backs (a promotion request). With
+	// KYTY_GPU_HOST_MIRROR_PROMOTE=0 such pages are not turned into device buffers (diagnostic).
+	[[nodiscard]] bool        SkipHostMirrorPromotion(uint64_t page_vaddr) const;
 	void               RunGarbageCollector();
 	// Inside a batch, CPU-data uploads share one barrier pair: they are recorded together at
 	// the end of the outermost batch, or before any other command is recorded (see
@@ -162,6 +189,23 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
+	RangeSet                                          m_bda_sync_cpu;
+	struct HostImport {
+		vk::DeviceMemory  memory  = nullptr;
+		vk::Buffer        buffer  = nullptr;
+		vk::DeviceAddress address = 0;
+		uint64_t          size    = 0;
+	};
+	// By guest (= host) address.
+	std::map<uint64_t, HostImport>                    m_host_imports;
+	bool              ImportHostRange(uint64_t vaddr, uint64_t size);
+	void              ReleaseHostImports(uint64_t vaddr, uint64_t size);
+	// Page-table entries of [vaddr, vaddr + size) that no buffer owns: the import, else 0.
+	void              WriteFallbackEntries(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] vk::DeviceAddress FallbackAddress(uint64_t page_vaddr) const;
+	std::mutex                                        m_mirror_mutex;
+	RangeSet                                          m_mirror_pending;
+	std::atomic<bool>                                 m_mirror_has_pending {false};
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

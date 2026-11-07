@@ -17,6 +17,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -144,6 +145,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		if (!m_host_imports.empty() && HasHostImports(buffer.CpuAddress(), buffer.Size())) {
+			WriteFallbackEntries(buffer.CpuAddress(), buffer.Size());
+		}
 		buffer.is_deleted = true;
 	}
 }
@@ -308,7 +312,10 @@ bool BufferCache::DownloadOnSideQueue(Buffer& buffer, uint64_t vaddr, uint64_t s
 	                               nullptr);
 	EXIT_NOT_IMPLEMENTED(m_side_command.end() != vk::Result::eSuccess);
 
-	// The semaphore wait orders the copy after the producer and makes its writes visible.
+	// The semaphore wait orders the copy after the producer and makes its writes visible. The
+	// producer was handed to the submitter (wait_tick < CurrentTick); wait until it really was
+	// submitted (asynchronous recording), so this is never a wait-before-signal submit.
+		m_scheduler.GetMasterSemaphore().WaitSubmitted(wait_tick);
 	const auto                   semaphore  = m_scheduler.GetMasterSemaphore().Handle();
 	const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
 	vk::TimelineSemaphoreSubmitInfo timeline {};
@@ -333,6 +340,9 @@ bool BufferCache::DownloadOnSideQueue(Buffer& buffer, uint64_t vaddr, uint64_t s
 	EXIT_NOT_IMPLEMENTED(waited != vk::Result::eSuccess);
 	EXIT_NOT_IMPLEMENTED(device.resetFences(1, &m_side_fence) != vk::Result::eSuccess);
 	m_side_download->Invalidate(0, total_size);
+	// Older asynchronous publishes (buffer or image downloads up to the producer's tick) land
+	// first, as on the main-queue path; later ones carry newer data and may follow.
+	m_scheduler.WaitPriorityOperations(wait_tick);
 	const auto* mapped = m_side_download->Mapped().data();
 	for (const auto& copy: copies) {
 		Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
@@ -380,6 +390,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	for (auto& [vaddr, import]: m_host_imports) {
+		(void)vaddr;
+		m_graphics.device.destroyBuffer(import.buffer, nullptr);
+		m_graphics.device.freeMemory(import.memory, nullptr);
+	}
+	m_host_imports.clear();
 	// Side-queue readbacks are synchronous, so nothing of these is in use here.
 	if (m_side_pool != nullptr) {
 		m_graphics.device.destroyFence(m_side_fence, nullptr);
@@ -408,7 +424,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	const auto tracked = profile ? Clock::now() : Clock::time_point {};
-	QueueBdaSync(vaddr, size);
+	QueueBdaSyncCpu(vaddr, size);
 	if (profile) {
 		const auto queued = Clock::now();
 		Common::DebugCounters::Add(
@@ -507,15 +523,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}();
 			bool use_side = false;
 			uint64_t wait_tick = 0;
-			if (side_readbacks && m_graphics.readback_queue != nullptr &&
-			    !m_scheduler.HasPendingPriorityOperations()) {
+			if (side_readbacks && m_graphics.readback_queue != nullptr) {
 				// Every GPU write to these bytes must already be submitted: work recorded since
-				// the last submit carries the current tick. Pruned entries were complete.
+				// the last submit carries the current tick. Pruned entries were complete. So
+				// must every pending asynchronous publish, which the side path waits for.
 				const auto producer = m_write_ticks.Max(start, end - start);
-				if (producer < m_scheduler.CurrentTick()) {
+				const auto publish  = m_scheduler.LatestPendingPriorityTick();
+				if (producer < m_scheduler.CurrentTick() && publish < m_scheduler.CurrentTick()) {
 					use_side  = true;
-					wait_tick = std::max(producer,
-					                     m_scheduler.GetMasterSemaphore().KnownGpuTick());
+					wait_tick = std::max({producer, publish,
+					                      m_scheduler.GetMasterSemaphore().KnownGpuTick()});
 				}
 			}
 			const bool downloaded = use_side
@@ -549,7 +566,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			QueueBdaSync(vaddr, size);
+			QueueBdaSyncCpu(vaddr, size);
 		}
 		if (profile) {
 			const auto body_ns =
@@ -568,11 +585,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		                              .count()));
 	}
 	if (profile) {
-		Common::DebugCounters::Add(
-		    Common::DebugCounters::Counter::BufferReadSyncNs,
-		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-		                              Clock::now() - sync_begin)
-		                              .count()));
+		const auto sync_ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - sync_begin).count());
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferReadSyncNs, sync_ns);
+		if (GuestGpu::IsGpuThread()) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuThreadReadbackNs, sync_ns);
+		}
 	}
 }
 
@@ -652,6 +670,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	new_buffer.pinned = new_buffer.pinned || overlap.pinned;
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	// The GPU-written bytes now reach the new buffer through this copy.
@@ -846,8 +865,14 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
+		static const bool trace = std::getenv("KYTY_GPU_MIRROR_TRACE") != nullptr;
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
+			if (trace && copy.size >= (1u << 20)) {
+				std::printf("upload read 0x%llx +0x%llx\n", static_cast<unsigned long long>(address),
+				            static_cast<unsigned long long>(copy.size));
+				std::fflush(stdout);
+			}
 			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
@@ -1055,6 +1080,9 @@ void BufferCache::RunGarbageCollector() {
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (buffer.pinned) {
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
@@ -1103,9 +1131,267 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 	m_bda_sync.Add(begin, end - begin);
 }
 
-RangeSet BufferCache::TakeBdaSync() {
+bool BufferCache::MirrorEnabled() {
+	static const bool enabled = [] {
+		const auto on = [](const char* name) {
+			const char* value = std::getenv(name);
+			return value != nullptr && value[0] == '1';
+		};
+		return on("KYTY_GPU_MIRROR");
+	}();
+	return enabled;
+}
+
+bool BufferCache::HostMirrorEnabled() {
+	static const bool enabled = [] {
+		const auto on = [](const char* name) {
+			const char* value = std::getenv(name);
+			return value != nullptr && value[0] == '1';
+		};
+		return on("KYTY_GPU_HOST_MIRROR") || on("KYTY_GPU_BUFFER_DESCRIPTORS");
+	}();
+	return enabled;
+}
+
+bool BufferCache::HasHostImports(uint64_t vaddr, uint64_t size) const {
+	auto it = m_host_imports.upper_bound(vaddr);
+	if (it != m_host_imports.begin()) {
+		const auto previous = std::prev(it);
+		if (previous->first + previous->second.size > vaddr) return true;
+	}
+	return it != m_host_imports.end() && it->first < vaddr + size;
+}
+
+bool BufferCache::SkipHostMirrorPromotion(uint64_t page_vaddr) const {
+	static const bool skip = [] {
+		const char* value = std::getenv("KYTY_GPU_HOST_MIRROR_PROMOTE");
+		return value != nullptr && value[0] == '0';
+	}();
+	if (!skip || !HostMirrorEnabled() || !HasHostImports(page_vaddr, CACHING_PAGESIZE)) return false;
+	const auto* owner = m_page_table.Find(page_vaddr >> PageTable::kPageBits);
+	return owner == nullptr || !*owner;
+}
+
+vk::DeviceAddress BufferCache::FallbackAddress(uint64_t page_vaddr) const {
+	auto it = m_host_imports.upper_bound(page_vaddr);
+	if (it == m_host_imports.begin()) return 0;
+	--it;
+	if (page_vaddr >= it->first + it->second.size) return 0;
+	// Bit 0 tags a host-mirror entry (get_bda_pointer reads through it and requests promotion).
+	return (it->second.address + (page_vaddr - it->first)) | 1u;
+}
+
+void BufferCache::WriteFallbackEntries(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto end   = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	std::vector<vk::DeviceAddress> run;
+	uint64_t                       run_start = 0;
+	const auto flush = [&]() {
+		if (run.empty()) return;
+		WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(run_start) * sizeof(vk::DeviceAddress),
+		                run.data(), run.size() * sizeof(vk::DeviceAddress));
+		run.clear();
+	};
+	for (uint64_t page = begin; page < end; page += CACHING_PAGESIZE) {
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		if (owner != nullptr && *owner) {
+			flush();
+			continue;
+		}
+		if (run.empty()) run_start = page;
+		run.push_back(FallbackAddress(page));
+	}
+	flush();
+}
+
+bool BufferCache::ImportHostRange(uint64_t vaddr, uint64_t size) {
+	if (!m_graphics.host_import_enabled || HasHostImports(vaddr, size)) return false;
+	const auto alignment = std::max<uint64_t>(m_graphics.host_import_alignment, CACHING_PAGESIZE);
+	const auto begin     = Common::AlignUp(vaddr, alignment);
+	const auto end       = Common::AlignDown(vaddr + size, alignment);
+	if (end <= begin) return false;
+	auto&       device = m_graphics.device;
+	auto*       host   = reinterpret_cast<void*>(begin);
+	const auto  type   = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	vk::MemoryHostPointerPropertiesEXT properties {};
+	if (device.getMemoryHostPointerPropertiesEXT(type, host, &properties) != vk::Result::eSuccess ||
+	    properties.memoryTypeBits == 0) {
+		return false;
+	}
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = type;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext = &external;
+	buffer_info.size  = end - begin;
+	buffer_info.usage = vk::BufferUsageFlagBits::eShaderDeviceAddress |
+	                    vk::BufferUsageFlagBits::eStorageBuffer |
+	                    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+	vk::Buffer buffer = nullptr;
+	if (device.createBuffer(&buffer_info, nullptr, &buffer) != vk::Result::eSuccess) return false;
+	vk::MemoryRequirements requirements {};
+	device.getBufferMemoryRequirements(buffer, &requirements);
+	const auto types = requirements.memoryTypeBits & properties.memoryTypeBits;
+	if (types == 0) {
+		device.destroyBuffer(buffer, nullptr);
+		return false;
+	}
+	vk::ImportMemoryHostPointerInfoEXT import_info {};
+	import_info.handleType   = type;
+	import_info.pHostPointer = host;
+	vk::MemoryAllocateFlagsInfo flags {};
+	flags.pNext = &import_info;
+	flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	vk::MemoryAllocateInfo allocate {};
+	allocate.pNext           = &flags;
+	allocate.allocationSize  = end - begin;
+	allocate.memoryTypeIndex = static_cast<uint32_t>(std::countr_zero(types));
+	vk::DeviceMemory memory = nullptr;
+	if (device.allocateMemory(&allocate, nullptr, &memory) != vk::Result::eSuccess) {
+		device.destroyBuffer(buffer, nullptr);
+		return false;
+	}
+	if (device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess) {
+		device.destroyBuffer(buffer, nullptr);
+		device.freeMemory(memory, nullptr);
+		return false;
+	}
+	vk::BufferDeviceAddressInfo address_info {};
+	address_info.buffer = buffer;
+	const auto address  = device.getBufferAddress(&address_info);
+	m_host_imports[begin] = {memory, buffer, address, end - begin};
+	WriteFallbackEntries(begin, end - begin);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::MirrorBytes, end - begin);
+	return true;
+}
+
+void BufferCache::ReleaseHostImports(uint64_t vaddr, uint64_t size) {
+	if (!HasHostImports(vaddr, size)) return;
+	// Nothing on the GPU may still read the imported pages once the guest unmaps them.
+	m_scheduler.Finish();
+	std::vector<uint64_t> released;
+	for (auto it = m_host_imports.begin(); it != m_host_imports.end(); ++it) {
+		if (it->first < vaddr + size && vaddr < it->first + it->second.size) released.push_back(it->first);
+	}
+	for (const auto key: released) {
+		auto import = m_host_imports.at(key);
+		m_host_imports.erase(key);
+		WriteFallbackEntries(key, import.size);
+		// Recorded table writes run before any later access; the GPU is idle for the old ones.
+		m_scheduler.DeferOperation([device = m_graphics.device, import] {
+			device.destroyBuffer(import.buffer, nullptr);
+			device.freeMemory(import.memory, nullptr);
+		});
+	}
+}
+
+void BufferCache::QueueMirror(uint64_t vaddr, uint64_t size) {
+	// Sparse (PRT) pages may have no backing; they stay on the lazy path.
+	if (LibKernel::Memory::OverlapsPrtAperture(vaddr, size)) return;
+	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto end   = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	std::lock_guard lock(m_mirror_mutex);
+	m_mirror_pending.Add(begin, end - begin);
+	m_mirror_has_pending.store(true, std::memory_order_release);
+}
+
+void BufferCache::ApplyMirror() {
+	if (!m_mirror_has_pending.load(std::memory_order_acquire)) {
+		return;
+	}
+	RangeSet pending;
+	{
+		std::lock_guard lock(m_mirror_mutex);
+		pending = std::exchange(m_mirror_pending, {});
+		m_mirror_has_pending.store(false, std::memory_order_relaxed);
+	}
+	if (HostMirrorEnabled()) {
+		// Never release imports here: ApplyMirror runs inside draw/dispatch preparation (PrepareBda),
+		// where ReleaseHostImports' Finish() submits a half-prepared command (hmir-2..4: the rest of
+		// the command never ran and the guest read garbage). Every remap path unmaps the GPU range
+		// first (UnmapGpuRange -> UnmapMirror, between commands), so ranges that still hold imports
+		// are re-queued live mappings: only the gaps between existing imports are imported.
+		pending.ForEach([this](uint64_t begin, uint64_t end) {
+			const auto import_gap = [this](uint64_t gap_begin, uint64_t gap_end) {
+				if (gap_end <= gap_begin || ImportHostRange(gap_begin, gap_end - gap_begin)) return;
+				static uint32_t failures = 0;
+				if (failures++ < 20) {
+					std::printf("Host mirror: import failed for 0x%llx +0x%llx\n",
+					            static_cast<unsigned long long>(gap_begin),
+					            static_cast<unsigned long long>(gap_end - gap_begin));
+				}
+			};
+			auto cursor = begin;
+			auto it     = m_host_imports.upper_bound(begin);
+			if (it != m_host_imports.begin()) --it;
+			for (; it != m_host_imports.end() && it->first < end; ++it) {
+				const auto import_end = it->first + it->second.size;
+				if (import_end <= cursor) continue;
+				import_gap(cursor, std::min(it->first, end));
+				cursor = std::max(cursor, import_end);
+			}
+			import_gap(cursor, end);
+		});
+		return;
+	}
+	pending.ForEach([this](uint64_t begin, uint64_t end) {
+		// One buffer per mapping (FindBuffer merges overlapping buffers into it); its pages enter
+		// the BDA page table and its contents are uploaded by the next BDA sync.
+		static const bool trace = std::getenv("KYTY_GPU_MIRROR_TRACE") != nullptr;
+		if (trace) {
+			std::printf("Mirror: 0x%llx +0x%llx (buffers=%zu)\n", static_cast<unsigned long long>(begin),
+			            static_cast<unsigned long long>(end - begin), m_buffers.size());
+			std::fflush(stdout);
+		}
+		const auto id = FindBuffer(begin, end - begin);
+		if (id) {
+			m_slot_buffers[id].pinned = true;
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::MirrorBytes, end - begin);
+		}
+	});
+}
+
+void BufferCache::UnmapMirror(uint64_t vaddr, uint64_t size) {
+	{
+		std::lock_guard lock(m_mirror_mutex);
+		m_mirror_pending.Subtract(vaddr, size);
+	}
+	ReleaseHostImports(vaddr, size);
+	const auto end = vaddr + size;
+	for (auto it = m_buffers.lower_bound(vaddr); it != m_buffers.end() && it->first < end; ++it) {
+		auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() >= vaddr && buffer.CpuAddress() + buffer.Size() <= end) {
+			buffer.pinned = false;
+		}
+	}
+}
+
+void BufferCache::QueueBdaSyncCpu(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
-	return std::exchange(m_bda_sync, {});
+	m_bda_sync_cpu.Add(begin, end - begin);
+}
+
+bool BufferCache::BdaSliceSyncEnabled() {
+	// KYTY_BDA_SLICE_SYNC=0 syncs CPU writes before every DMA draw again; follows KYTY_AB_PERIOD
+	// unless set to "fixed" (stays on during other A/B tests).
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_BDA_SLICE_SYNC");
+		if (value == nullptr) return 1;
+		if (value[0] == 'f') return 2;
+		return value[0] == '0' ? 0 : 1;
+	}();
+	return mode == 2 || (mode == 1 && Common::DebugCounters::AbVariant());
+}
+
+RangeSet BufferCache::TakeBdaSync(bool all) {
+	std::lock_guard lock(m_bda_sync_mutex);
+	auto taken = std::exchange(m_bda_sync, {});
+	if (all) {
+		m_bda_sync_cpu.ForEach([&taken](uint64_t begin, uint64_t end) { taken.Add(begin, end - begin); });
+		m_bda_sync_cpu = {};
+	}
+	return taken;
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

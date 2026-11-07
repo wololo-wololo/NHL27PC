@@ -33,6 +33,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -1394,9 +1396,43 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 	return DrawEmitInfo {vertex_offset + first_vertex, instance_offset};
 }
 
+// Diagnostic (KYTY_SKIP_DRAWS=<percent>[,<delay s>]): drop that share of graphics draws before any
+// host work, deterministically (draw counter modulo 100), starting <delay> seconds after the first
+// draw (so the menus still render for the autopilot). Rendering is wrong; the frame rate then
+// shows how fast the game's own threads run when the GPU thread is cheaper (60 FPS feasibility,
+// 2026-11-07).
+static bool SkipDrawForDiagnostics() {
+	static uint32_t percent = 0;
+	static double   delay   = 0.0;
+	static const bool configured = [] {
+		const char* value = std::getenv("KYTY_SKIP_DRAWS");
+		if (value != nullptr) {
+			int p = 0;
+			if (std::sscanf(value, "%d,%lf", &p, &delay) >= 1) {
+				percent = static_cast<uint32_t>(std::clamp(p, 0, 100));
+			}
+		}
+		return percent != 0;
+	}();
+	if (!configured) {
+		return false;
+	}
+	static const auto first = std::chrono::steady_clock::now();
+	if (std::chrono::duration<double>(std::chrono::steady_clock::now() - first).count() < delay) {
+		return false;
+	}
+	static uint32_t counter = 0;
+	const bool skip = (counter++ % 100u) < percent;
+	if (skip) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SkippedDraws);
+	}
+	return skip;
+}
+
 bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	if (SkipDrawForDiagnostics()) return true;
 	Common::DebugCounters::ScopedTimer timer(
 	    Common::DebugCounters::Counter::DrawProcessCalls,
 	    Common::DebugCounters::Counter::DrawProcessNs);
@@ -1507,6 +1543,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	if (SkipDrawForDiagnostics()) return true;
 	Common::DebugCounters::ScopedTimer timer(
 	    Common::DebugCounters::Counter::DrawProcessCalls,
 	    Common::DebugCounters::Counter::DrawProcessNs);
