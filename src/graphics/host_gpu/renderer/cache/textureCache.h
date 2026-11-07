@@ -55,6 +55,22 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+
+	// Lookup memos (2026-11-07 part 12). A FindImage result found by a direct backing match (no
+	// overlap resolution, block-alias candidate, stencil association or new image) stays the
+	// answer until an image overlapping the looked-up range is registered, unregistered or
+	// re-associated; those changes are logged with a generation number.
+	[[nodiscard]] uint64_t MutationGeneration() const {
+		return m_mutation_generation.load(std::memory_order_acquire);
+	}
+	// Whether the last FindImage on this thread was a direct match (see above).
+	[[nodiscard]] static bool LastFindReusable();
+	// Repeats FindImage's side effects (LRU touch, access tick, color-metadata clear) for a result
+	// memoized at `generation` (read before that FindImage) and returns true; returns false and
+	// does nothing when an image overlapping `desc`'s range changed since then or `id` no longer
+	// holds `image_data`.
+	[[nodiscard]] bool ReuseFoundImage(ImageId id, uint64_t generation, const ImageDesc& desc,
+	                                   uint32_t metadata_base_layer, GuestRange image_data);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -203,6 +219,10 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	// Ranges of the last registrations/unregistrations/stencil re-associations (lookup memos).
+	void                                  LogMutation(GuestRange range);
+	std::array<GuestRange, 256>           m_mutations {};
+	std::atomic<uint64_t>                 m_mutation_generation {0};
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 

@@ -230,6 +230,11 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// The full resolve; `reusable` (optional) reports a direct texture-cache match (see
+	// TextureCache::LastFindReusable) that the memo in ResolveTexture may keep.
+	[[nodiscard]] TextureBinding ResolveTextureUncached(
+	    const ShaderRecompiler::IR::ImageResource& resource,
+	    const ShaderRecompiler::IR::DescriptorValue& value, bool* reusable = nullptr);
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
@@ -278,6 +283,18 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// ResolveTexture memo (2026-11-07 part 12): descriptor words and image-resource flags ->
+	// resolved binding, revalidated per use by TextureCache::ReuseFoundImage.
+	struct TextureMemoEntry {
+		std::array<uint32_t, 12> key {};
+		bool                     valid               = false;
+		uint64_t                 generation          = 0;
+		uint32_t                 metadata_base_layer = 0;
+		GuestRange               image_data;
+		ImageId                  id;
+		TextureCache::ImageDesc  desc;
+	};
+	std::vector<TextureMemoEntry>         m_texture_memo;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;

@@ -719,15 +719,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		const bool counters_enabled = Common::DebugCounters::Enabled();
 		Common::DebugCounters::SetCurrentOpcode(opcode);
-		const auto packet_start =
-		    counters_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		// FastClock (rdtsc): ~1.3 M packets/s made steady_clock (QueryPerformanceCounter) ~3% of
+		// the GPU thread in draw-heavy scenes (2026-11-07 part 12).
+		const auto packet_start = counters_enabled ? Common::DebugCounters::FastClock::now()
+		                                           : Common::DebugCounters::FastClock::time_point {};
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		Common::DebugCounters::SetCurrentOpcode(Common::DebugCounters::Detail::OPCODE_SLOTS);
 		if (counters_enabled) {
 			Common::DebugCounters::AddOpcode(
 			    opcode, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-			                                      std::chrono::steady_clock::now() - packet_start)
+			                                      Common::DebugCounters::FastClock::now() - packet_start)
 			                                      .count()));
 		}
 		EXIT_IF(packet_dw > remaining_dw);

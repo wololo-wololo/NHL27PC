@@ -69,6 +69,11 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::i
 	X(BindingImageResolves) \
 	X(BindingSamplerReuses) \
 	X(BindingSamplerResolves) \
+	X(TextureMemoHits) /* ResolveTexture answered from its memo (part 12). */ \
+	X(TextureMemoMisses) \
+	X(TextureMemoMismatches) /* KYTY_TEXTURE_MEMO_VERIFY=1: memo differs from a full resolve. */ \
+	X(TargetMemoHits) /* Render-target memo reused its image without FindImage (part 12). */ \
+	X(TargetMemoMisses) \
 	X(AgcHelperPackets) /* Packets produced through native Graphics5 command-buffer helpers. */ \
 	X(AgcHelperDwords) \
 	X(AgcDcbSubmits) /* Guest graphics command-buffer submissions. */ \

@@ -467,8 +467,138 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
+// Lookup memos for texture-cache images (2026-11-07 part 12). KYTY_TEXTURE_MEMO=0 disables both
+// the ResolveTexture memo and the render-target image reuse; they follow KYTY_AB_PERIOD.
+// KYTY_TEXTURE_MEMO_VERIFY=1 also runs the full resolve on every memo hit and counts/prints
+// differences (TextureMemoMismatches).
+bool TextureMemoEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && Common::DebugCounters::AbVariant();
+}
+
+bool TextureMemoVerify() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_MEMO_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void VerifyTargetMemo(TextureCache& cache, const TextureCache::ImageDesc& before_lookup,
+                      ImageId reused, bool exact_format) {
+	if (!TextureMemoVerify()) {
+		return;
+	}
+	auto       desc = before_lookup;
+	const auto full = cache.FindImage(desc, exact_format);
+	if (full != reused) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureMemoMismatches);
+		static std::atomic<uint32_t> printed {0};
+		if (printed.fetch_add(1, std::memory_order_relaxed) < 20u) {
+			std::printf("Target memo MISMATCH addr=0x%016llx id %u vs %u\n",
+			            static_cast<unsigned long long>(desc.info.data.address),
+			            static_cast<uint32_t>(reused.index), static_cast<uint32_t>(full.index));
+		}
+	}
+}
+
+// Everything ResolveTextureUncached reads from the resource besides its identity in the program.
+static bool TextureMemoKey(const ShaderRecompiler::IR::ImageResource&   resource,
+                           const ShaderRecompiler::IR::DescriptorValue& value,
+                           std::array<uint32_t, 12>&                    key) {
+	const auto resource_class = static_cast<uint32_t>(resource.resource_class);
+	const auto numeric_class  = static_cast<uint32_t>(resource.numeric_class);
+	const auto dimension      = static_cast<uint32_t>(resource.dimension);
+	const auto mip_mode       = static_cast<uint32_t>(resource.mip_mode);
+	const auto conversion     = static_cast<uint32_t>(resource.conversion_format);
+	if (resource.heap || value.dword_count > 8 || resource_class > 0xff || numeric_class > 0xff ||
+	    dimension > 0xff || mip_mode > 0xff || conversion > 0xffff || resource.mip_count > 0xffff ||
+	    resource.shader_swizzle > 0xfffff) {
+		return false;
+	}
+	std::copy(value.dwords.begin(), value.dwords.end(), key.begin());
+	key[8]  = value.dword_count;
+	key[9]  = resource_class | (numeric_class << 8u) | (dimension << 16u) | (mip_mode << 24u);
+	key[10] = conversion | (resource.mip_count << 16u);
+	key[11] = resource.shader_swizzle | (uint32_t {resource.read} << 20u) |
+	          (uint32_t {resource.written} << 21u) | (uint32_t {resource.atomic} << 22u) |
+	          (uint32_t {resource.atomic64} << 23u) |
+	          (uint32_t {resource.unfiltered_access_only} << 24u) |
+	          (uint32_t {resource.depth_compare} << 25u) | (uint32_t {resource.cube} << 26u) |
+	          (uint32_t {resource.r128} << 27u);
+	return true;
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	using Common::DebugCounters::Counter;
+	std::array<uint32_t, 12> key {};
+	if (!TextureMemoEnabled() || !TextureMemoKey(resource, value, key)) {
+		return ResolveTextureUncached(resource, value);
+	}
+	constexpr size_t MemoEntries = 1024;
+	if (m_texture_memo.empty()) {
+		m_texture_memo.resize(MemoEntries);
+	}
+	uint64_t hash = 0;
+	for (const auto word: key) {
+		hash = (hash ^ word) * 0x9e3779b97f4a7c15ull;
+		hash ^= hash >> 29u;
+	}
+	auto& entry         = m_texture_memo[hash & (MemoEntries - 1)];
+	auto& texture_cache = m_context.GetTextureCache();
+	if (entry.valid && entry.key == key &&
+	    texture_cache.ReuseFoundImage(entry.id, entry.generation, entry.desc,
+	                                  entry.metadata_base_layer, entry.image_data)) {
+		Common::DebugCounters::Add(Counter::TextureMemoHits);
+		TextureBinding hit {entry.id, nullptr, entry.desc};
+		if (TextureMemoVerify()) {
+			const auto full = ResolveTextureUncached(resource, value);
+			const auto& a   = hit.desc;
+			const auto& b   = full.desc;
+			if (full.image_id != hit.image_id || !(a.view_info == b.view_info) ||
+			    a.info.data != b.info.data || a.info.extent != b.info.extent ||
+			    a.info.pixel_format != b.info.pixel_format || a.type != b.type ||
+			    a.info.resources.levels != b.info.resources.levels ||
+			    a.info.resources.layers != b.info.resources.layers) {
+				Common::DebugCounters::Add(Counter::TextureMemoMismatches);
+				static std::atomic<uint32_t> printed {0};
+				if (printed.fetch_add(1, std::memory_order_relaxed) < 20u) {
+					std::printf("Texture memo MISMATCH addr=0x%016llx id %u vs %u\n",
+					            static_cast<unsigned long long>(a.info.data.address),
+					            static_cast<uint32_t>(hit.image_id.index),
+					            static_cast<uint32_t>(full.image_id.index));
+				}
+				return full;
+			}
+		}
+		return hit;
+	}
+	Common::DebugCounters::Add(Counter::TextureMemoMisses);
+	const auto generation = texture_cache.MutationGeneration();
+	bool       reusable   = false;
+	auto       result     = ResolveTextureUncached(resource, value, &reusable);
+	entry.valid           = reusable;
+	if (reusable) {
+		entry.key                 = key;
+		entry.generation          = generation;
+		entry.id                  = result.image_id;
+		entry.desc                = result.desc;
+		entry.metadata_base_layer = result.desc.view_info.base_layer;
+		entry.image_data          = texture_cache.m_slot_images[result.image_id].info.data;
+	}
+	return result;
+}
+
+TextureBinding RenderExecutor::ResolveTextureUncached(
+    const ShaderRecompiler::IR::ImageResource& resource,
+    const ShaderRecompiler::IR::DescriptorValue& value, bool* reusable) {
+	if (reusable != nullptr) {
+		*reusable = false;
+	}
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -611,6 +741,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.heap = resource.heap;
 
 	auto id = texture_cache.FindImage(desc, shader_conversion);
+	if (reusable != nullptr) {
+		*reusable = id && TextureCache::LastFindReusable();
+	}
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
 		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};

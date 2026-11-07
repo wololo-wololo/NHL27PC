@@ -62,6 +62,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		uint32_t                                     mask = 0, slice_offset = 0;
 		bool                                         ignore = false, exact = false;
 		RenderColorInfo                              result;
+		// The image found for `result` and its state (part 12 lookup memo; see
+		// TextureCache::ReuseFoundImage).
+		bool                                         image_reusable = false;
+		uint64_t                                     generation     = 0;
+		GuestRange                                   image_data;
+		RenderColorInfo                              found;
 	};
 	static thread_local std::array<Memo, 8> memos;
 	static const bool memo_enabled = [] {
@@ -76,8 +82,25 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		if (memo.valid && memo.mask == raw_mask && memo.slice_offset == render_target_slice_offset &&
 		    memo.ignore == ignore_target_mask && memo.exact == exact_format && memo.regs == regs) {
 			auto& cache = m_context.GetTextureCache();
+			if (memo.image_reusable && TextureMemoEnabled() &&
+			    cache.ReuseFoundImage(memo.found.image_id, memo.generation, memo.found.desc,
+			                          memo.found.desc.view_info.base_layer, memo.image_data)) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoHits);
+				r = memo.found;
+				VerifyTargetMemo(cache, memo.result.desc, r.image_id, exact_format);
+				BindRenderTarget(r.image_id);
+				return;
+			}
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoMisses);
 			r                     = memo.result;
+			const auto generation = cache.MutationGeneration();
 			r.image_id            = cache.FindImage(r.desc, exact_format);
+			memo.image_reusable   = r.image_id && TextureCache::LastFindReusable();
+			if (memo.image_reusable) {
+				memo.generation = generation;
+				memo.image_data = cache.m_slot_images[r.image_id].info.data;
+				memo.found      = r;
+			}
 			BindRenderTarget(r.image_id);
 			return;
 		}
@@ -93,6 +116,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			if (!enabled || slot >= memos.size()) return;
 			auto& memo = memos[slot];
 			memo.valid          = resolved;
+			memo.image_reusable = false;
 			if (!resolved) return;
 			memo.regs = regs;
 			memo.mask = mask;

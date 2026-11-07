@@ -311,7 +311,33 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	// Lookup memo (part 12, KYTY_TEXTURE_MEMO=0 disables): the description depends only on the
+	// depth registers, and the image found for it stays valid while TextureCache::ReuseFoundImage
+	// says so. Most draws repeat the previous draw's depth target.
+	struct DepthMemo {
+		bool                                                valid = false;
+		std::array<uint8_t, sizeof(HW::DepthRenderTarget)> regs {};
+		TextureCache::ImageDesc                             desc;  // before FindImage
+		bool                                                image_reusable = false;
+		uint64_t                                            generation     = 0;
+		GuestRange                                          image_data;
+		ImageId                                             image;
+		TextureCache::ImageDesc                             found; // after FindImage
+	};
+	static thread_local DepthMemo memo;
+	const bool memo_enabled = TextureMemoEnabled();
+	std::array<uint8_t, sizeof(HW::DepthRenderTarget)> regs {};
+	std::memcpy(regs.data(), &z, sizeof(z));
+	const bool memo_hit = memo_enabled && memo.valid && memo.regs == regs;
+	if (!memo_hit) {
+		r.desc = MakeDepthTargetDesc(buffer, z);
+		if (memo_enabled) {
+			memo.valid          = true;
+			memo.regs           = regs;
+			memo.desc           = r.desc;
+			memo.image_reusable = false;
+		}
+	}
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
@@ -349,7 +375,31 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 	}
 	auto& cache = m_context.GetTextureCache();
+	if (memo_hit) {
+		if (memo.image_reusable &&
+		    cache.ReuseFoundImage(memo.image, memo.generation, memo.found,
+		                          memo.found.view_info.base_layer, memo.image_data)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoHits);
+			r.desc     = memo.found;
+			r.image_id = memo.image;
+			VerifyTargetMemo(cache, memo.desc, r.image_id, false);
+			BindRenderTarget(r.image_id);
+			return;
+		}
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TargetMemoMisses);
+		r.desc = memo.desc;
+	}
+	const auto generation = cache.MutationGeneration();
 	r.image_id = cache.FindImage(r.desc);
+	if (memo_enabled) {
+		memo.image_reusable = r.image_id && TextureCache::LastFindReusable();
+		if (memo.image_reusable) {
+			memo.generation = generation;
+			memo.image      = r.image_id;
+			memo.image_data = cache.m_slot_images[r.image_id].info.data;
+			memo.found      = r.desc;
+		}
+	}
 	BindRenderTarget(r.image_id);
 }
 

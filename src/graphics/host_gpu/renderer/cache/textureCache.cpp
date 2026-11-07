@@ -209,6 +209,47 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
+namespace {
+thread_local bool t_last_find_reusable = false;
+} // namespace
+
+bool TextureCache::LastFindReusable() {
+	return t_last_find_reusable;
+}
+
+void TextureCache::LogMutation(GuestRange range) {
+	const auto generation = m_mutation_generation.load(std::memory_order_relaxed);
+	m_mutations[generation % m_mutations.size()] = range;
+	m_mutation_generation.store(generation + 1, std::memory_order_release);
+}
+
+bool TextureCache::ReuseFoundImage(ImageId id, uint64_t generation, const ImageDesc& desc,
+                                   uint32_t metadata_base_layer, GuestRange image_data) {
+	{
+		std::scoped_lock lock {m_lock};
+		const auto now = m_mutation_generation.load(std::memory_order_relaxed);
+		if (now - generation > m_mutations.size()) {
+			return false;
+		}
+		const auto lookup = desc.info.data;
+		for (auto g = generation; g != now; ++g) {
+			const auto& changed = m_mutations[g % m_mutations.size()];
+			if (changed.address < lookup.End() && lookup.address < changed.End()) {
+				return false;
+			}
+		}
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || image->depth_id ||
+		    image->info.data != image_data) {
+			return false;
+		}
+		image->tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(*image);
+	}
+	MaterializeColorClear(id, desc, metadata_base_layer);
+	return true;
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	RegisterImage(id);
@@ -228,6 +269,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	image.registered = true;
+	LogMutation(image.info.data);
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
 }
@@ -256,6 +298,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	LogMutation(image.info.data);
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1434,7 +1477,9 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.stencil_ids.push_back(association);
 		}
+		LogMutation(record.info.data);
 		record.info                 = plane;
+		LogMutation(record.info.data);
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
 	}
@@ -1452,11 +1497,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	t_last_find_reusable = false;
 	{
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-		bool block_alias = false;
+		bool block_alias     = false;
+		bool alias_candidate = false; // Lookup memos: SafeToDownload can change.
+		bool stencil_match   = false;
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
@@ -1470,16 +1518,20 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			    image.info.resources.layers >= desc.info.resources.layers &&
 			    desc.info.bytes_per_block == 1 &&
 			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
-				result = id;
+				result        = id;
+				stencil_match = true;
 				break;
 			}
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
-			} else if (image.SafeToDownload() &&
-			           BcAlias::Matches(desc.info, image.info)) {
-				block_alias = true;
+			} else if (BcAlias::Matches(desc.info, image.info)) {
+				alias_candidate = true;
+				block_alias |= image.SafeToDownload();
 			}
 		}
+		const bool    direct_match = result && !stencil_match && !alias_candidate &&
+		                             !m_slot_images[result].depth_id;
+		const ImageId direct_result = result;
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
@@ -1535,6 +1587,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				inserted.MarkBufferModified();
 			}
 		}
+		t_last_find_reusable = direct_match && result == direct_result && view_mip < 0 &&
+		                       view_layer < 0 && desc.type != BindingType::VideoOut;
 		auto& image = m_slot_images[result];
 		if (view_mip >= 0) {
 			desc.view_info.base_level = static_cast<uint32_t>(view_mip);

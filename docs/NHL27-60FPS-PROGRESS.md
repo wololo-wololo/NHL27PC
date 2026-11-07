@@ -2,6 +2,102 @@
 
 Last updated: 2026-11-07 (Europe/Berlin)
 
+## Session 2026-11-07, part 12: per-draw cost in the draw-heavy intro
+
+The user chose "per-draw cost work" after part 11 (goal: the 14–17 FPS intro/lineup at 5–7k draws
+per frame).
+
+- **Where a draw's ~6.6 µs went (heavy intro seconds, `pmiss-2` counters):** shader-resource
+  walk/materialization ~2.7 µs, binding resolve (`PrepareBindings`: texture/sampler resolves) ~0.85,
+  buffer rebinding/sync ~0.6, render/depth target lookup ~0.8, commit ~0.45. **GPU-thread
+  sampler in the same scene (`dc-prof-1`, `-Sample '78,26'`):** JIT walker 17.5%, waits 14%,
+  `ObtainBuffer` 7.5% (`SynchronizeBuffer` 5.0%), `FindImage` 6.7% (`FindImagesInRegion` 3.9%),
+  `ResolveTexture` 6.2%, `NtProtectVirtualMemory` 3.8%, `RtlQueryPerformanceCounter` 2.9%.
+- **Fix 1: the per-PM4-packet opcode timer (`graphicsRun.cpp`) used `steady_clock`**
+  (QueryPerformanceCounter) twice per packet, ~1.3 M packets/s. Now `FastClock` (rdtsc), like the
+  other stage timers.
+- **Fix 2: texture-cache lookup memos (on, `KYTY_TEXTURE_MEMO=0` disables, follows `KYTY_AB_PERIOD`).**
+  - `TextureCache` logs every registration, unregistration and stencil re-association (address
+    range + generation, 256-entry ring). `FindImage` reports whether its result was a *direct
+    match* (`SameBacking`, no overlap resolution, no block-alias candidate, no stencil association,
+    no new image). `ReuseFoundImage(id, generation, desc, …)` accepts a memoized result only if no
+    logged change overlaps the looked-up range and the image still holds the same range, then
+    repeats `FindImage`'s side effects (access tick, LRU touch, `MaterializeColorClear`).
+  - `ResolveTexture` memo: 1,024 direct-mapped entries keyed by the T# words plus every
+    image-resource flag the resolve reads (heap resources excluded). The render-target memo now
+    also reuses its image, and the depth target gets the same memo (description keyed by the raw
+    depth registers).
+  - `KYTY_TEXTURE_MEMO_VERIFY=1` runs the full lookup beside every hit: `tmv-1` 13.0 M texture
+    hits, `tmv-2` 14.3 M texture + 15.0 M render/depth hits, **0 mismatches**. Hit rates 67%
+    (textures) and 98% (targets). Rendering correct.
+  - `abm-1` in-run A/B: render/depth target resolve 0.92 → 0.37 µs per draw, binding resolve
+    2.49 → 1.40. The A/B's "off" phase also turned off the older `KYTY_RT_MEMO` (same A/B flag),
+    so its −23% per draw overstates the gain; the before/after table below is the honest number.
+- **Fix 3: cheaper reachability marks in SRT walkers (on, `KYTY_WALKER_FAST_MARKS=0` disables).**
+  The walker is a lazily evaluated DAG; its block-reachability pass marked every successor
+  with compare-branch-store on scratch flag bytes. A forward successor that no control Phi
+  rechecks is now one store (setting a set flag is a no-op; only rechecks and retreating edges
+  need the test). The verify-mode reference walker keeps the old form: `wfm-v1`
+  (`KYTY_WALKER_VERIFY=1`) **9.4 M walks, 0 mismatches**. Intro walker statistics
+  (`KYTY_WALK_STATS=96,66`, `wst12-2` → `wst12-3`): the big block walkers are 8–25% faster
+  (VS `0xe352…` 2.23 → 1.97 µs, PS `0x860c…` 12.0 → 9.0 µs), time-weighted −8%.
+- **Fix 4: nested walker thunks (on, `KYTY_WALKER_NEST=0` disables).** A value whose only use is
+  one argument fetch in another thunk's body (consumer not a Phi, LogicalAnd/Or or folded value)
+  is emitted inline at that fetch: slot, but no state byte, call or return. The consumer runs at
+  most once per walk, so reads, captures and their order are the lazy walker's. `wnest-v1`
+  (`KYTY_WALKER_VERIFY=1`): **10.5 M walks, 0 mismatches**. Small: in the big vertex walkers
+  almost every thunk is a constant-buffer read shared by several block conditions (VS
+  `0xe352…`: 128 blocks, nothing nested); compute `0xf7ac…` 6.7 → 4.1 µs.
+- **Fix 5: partial walker prefetch (on, `KYTY_WALKER_PREFETCH_PARTIAL=0` restores none).** Walkers
+  needing more than 32 prefetches got none; they now get their first 32. Big pixel walkers'
+  cold cost fell (PS `0xb8fa…` 4.37 → 3.65 µs) with warm cost unchanged.
+- **Walker result, same build, all three walker changes off vs on (`wof-1` vs `p12-2`):** walk per
+  program lookup menus 2,140 → 1,975 ns, intro 1,208 → 1,128, early play 1,396 → 1,249
+  (−7 to −11%, ~0.2 µs per draw). The walker-statistics runs suggested −14% (`wst12-2` →
+  `wst12-6`); trust the same-build comparison.
+- **Result, draw-heavy seconds (> 4,500 draws per frame, tool `tools/perf/intro.py`):**
+
+  | | Previous build (`pmiss-2`, `pcs-2`, `dc-prof-1`, `dflt-3`) | This build (`gpt-1`, `p12-1`, `p12-2`, `wof-1`) |
+  |---|---|---|
+  | Draw cost (`DrawProcessNs` per draw) | 6.59–6.72 µs | 6.02–6.44 µs (**−7%**) |
+  | GPU-thread time per draw of a frame | 9.8–10.1 µs | 9.2–9.9 µs (−5%) |
+  | FPS | 14.4–15.3 | 14.0–17.4 |
+
+  - **Intro FPS is not a reliable metric between runs:** the same build gives 17.8–23.9 FPS over
+    t 70–106, depending on how the skip taps land (draws per frame there vary 3,300–4,500 between
+    runs). An earlier draft of this section claimed "20 → 23.5 FPS" from two lucky runs; that was
+    wrong. Compare per-draw cost, or use in-run A/Bs.
+  - The `abm-1` A/B (memo "off" also disabling the older render-target memo) and the counters
+    agree that target resolve and texture resolve got much cheaper; most of the rest of a draw
+    (walker, buffer sync, commit) did not change.
+- **The heavy intro is still GPU-thread bound, not GPU bound:** `gpt-1` (`KYTY_GPU_TIMING=1`) shows
+  the GPU busy only ~42% there (26 ms per frame at 16 FPS) while PM4 processing stays ~880 ms/s.
+- **The walker is compute bound now:** cache-hot repeats take 62% of walk time (3.3 of 5.3 s in
+  the intro window). Its code is ~45% flag checks (`cmpb`/`jne` on node states and reachability
+  bytes) plus a call/ret per node thunk.
+- **Device losses:** 2 in 17 runs with these changes (`wst12-1` at the start-game load, `wst12-4`
+  just after the arena; both the long-standing `0x0ab3a7c64ccce901` / `streamBuffer.cpp:183` /
+  2348×1320 re-detile signature): within the known ~1-in-5 rate, nothing new.
+- New: `KYTY_WALK_STATS=<report s>,<start s>` (window), `tools/perf/intro.py`, counters
+  `TextureMemoHits/Misses/Mismatches`, `TargetMemoHits/Misses`.
+- **Why an eager walker rewrite was not done:** evaluating values the lazy walker would skip
+  (unchosen Select arms, reads in unreached blocks, words after an unknown descriptor word) adds
+  guest reads and captured addresses, which feed the specialization-read overlap checks. An
+  eager scheme needs a proof of which reads every walk executes, and the verify mode would have
+  to compare captures as sets. The large vertex walkers are dominated by their reachability
+  pass over many blocks whose conditions share constant-buffer reads.
+- **Next steps, in order:**
+  1. Walker, if continued: evaluate shared leaf reads (user data + constant offset) that the
+     first block's condition or an unconditional root needs once in the prologue into
+     registers or slots without state checks, and give block conditions of acyclic CFGs without
+     restarts plain (non-memoized) code. Expect ~10–20% of walker time, not a halving; the walker
+     is ~2 µs per draw.
+  2. `ObtainBuffer`/`SynchronizeBuffer` per binding (~0.6 µs per draw): skip the tracker walk when
+     a cheap "nothing CPU-dirty in range" check says so; avoid the per-call `std::vector` of copies.
+  3. Hot write-fault pages (`NtProtectVirtualMemory` 3.8% on the GPU thread plus game-thread
+     faults); part 10's caveats apply.
+  4. Part 11's loading-screen items stay open.
+
 ## Session 2026-11-07, part 11: on-ice "regression", menu-to-game transition
 
 The user also asked for a steady 30 during the menu-to-game transition ("breaks down quite a lot").

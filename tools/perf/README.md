@@ -26,6 +26,7 @@ Local helpers from the 2026-11-02 session. Paths are hard-coded for this machine
 | `cmpgroups.py START END A_LOG[,…] B_LOG[,…] [TOP]` | Mean per-second counters of two groups of runs over a window, sorted by difference. |
 | `phasecost.py LOG NAME:START-END…` | Per-frame and per-draw cost of each Ns counter for named time windows of one run. |
 | `timeline.py LOG START END` | Second-by-second transition timeline (flips, draws/frame, PM4, compiles, waits, uploads). |
+| `intro.py LOG…` | Per run: FPS, worst second, draws per frame and µs per draw for the pre-game intro (t 70–106), its >4,500-draw seconds and early play (t 115–128). |
 | `rbattr.py LOG START END` | Readback time by PM4 opcode (`rbopXX`). |
 | `nsys-capture.ps1` | Nsight Systems CPU sampling + Vulkan trace. Needs an elevated PowerShell (the user approved this). |
 | `gpu_workload.py DB`, `cpu_threads.py DB [N]` | Summaries of an exported Nsight `.sqlite`. |
@@ -59,6 +60,12 @@ SRT walker (descriptor materialization JIT, `SrtWalker.cpp`):
 - `KYTY_PRESENT_QUEUE=0`: present on the main queue (default: a separate queue).
 
 
+Texture-cache lookup memos (2026-11-07 part 12, on by default, follow `KYTY_AB_PERIOD`):
+
+- `KYTY_TEXTURE_MEMO=0` disables the `ResolveTexture` memo and the render-target/depth image
+  reuse. `KYTY_TEXTURE_MEMO_VERIFY=1` runs the full lookup beside every memo hit and counts
+  differences (`TextureMemoMismatches`, `Texture memo MISMATCH` / `Target memo MISMATCH` lines).
+  Counters `TextureMemoHits/Misses`, `TargetMemoHits/Misses`.
 
 GPU time per shader:
 

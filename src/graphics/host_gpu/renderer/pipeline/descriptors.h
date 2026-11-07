@@ -19,6 +19,13 @@ namespace Libs::Graphics {
 struct ShaderStageRuntime;
 struct ShaderModule;
 
+// Texture-cache lookup memos (KYTY_TEXTURE_MEMO, part 12; defined in descriptors.cpp).
+[[nodiscard]] bool TextureMemoEnabled();
+[[nodiscard]] bool TextureMemoVerify();
+// KYTY_TEXTURE_MEMO_VERIFY=1: compares a reused render-target image with a full FindImage.
+void VerifyTargetMemo(TextureCache& cache, const TextureCache::ImageDesc& before_lookup,
+                      ImageId reused, bool exact_format);
+
 struct TextureBinding {
 	ImageId                    image_id;
 	vk::ImageView              image_view = nullptr;
