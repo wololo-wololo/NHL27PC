@@ -23,6 +23,9 @@ Local helpers from the 2026-11-02 session. Paths are hard-coded for this machine
 | `keys.py LOG START END KEYS…` | Raw per-second values. |
 | `abstat.py LOG START END [KEYS…]` | Compares `ab=0` vs `ab=1` seconds of an in-run A/B (`KYTY_AB_PERIOD`). |
 | `slowfast.py START END SLOW_MAX FAST_MIN LOG…` | Compares counters between slow and fast seconds (by `FlipsRequested`) across logs. |
+| `cmpgroups.py START END A_LOG[,…] B_LOG[,…] [TOP]` | Mean per-second counters of two groups of runs over a window, sorted by difference. |
+| `phasecost.py LOG NAME:START-END…` | Per-frame and per-draw cost of each Ns counter for named time windows of one run. |
+| `timeline.py LOG START END` | Second-by-second transition timeline (flips, draws/frame, PM4, compiles, waits, uploads). |
 | `rbattr.py LOG START END` | Readback time by PM4 opcode (`rbopXX`). |
 | `nsys-capture.ps1` | Nsight Systems CPU sampling + Vulkan trace. Needs an elevated PowerShell (the user approved this). |
 | `gpu_workload.py DB`, `cpu_threads.py DB [N]` | Summaries of an exported Nsight `.sqlite`. |

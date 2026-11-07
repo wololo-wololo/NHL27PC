@@ -460,6 +460,32 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (module != nullptr) return bind(*module);
 	}
 
+	// Cache miss: everything below (source preparation, translation, materialization, module
+	// compile). Logged so shaders that recompile on every run (warm store) can be found.
+	struct MissTimer {
+		ShaderType                            stage;
+		uint64_t                              hash;
+		bool                                  known;
+		Common::DebugCounters::FastClock::time_point start = Common::DebugCounters::FastClock::now();
+		~MissTimer() {
+			const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                          Common::DebugCounters::FastClock::now() - start)
+			                                          .count());
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::ProgramMisses);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::ProgramMissNs, ns);
+			static const bool log = [] {
+				const char* value = std::getenv("KYTY_LOG_PROGRAM_MISSES");
+				return value == nullptr || value[0] != '0';
+			}();
+			if (log && ns >= 20'000'000) {
+				std::printf("Program miss: %s %016llx %s %.0f ms\n",
+				            ShaderRecompiler::StageName(stage), static_cast<unsigned long long>(hash),
+				            known ? "new-variant" : "new-program", static_cast<double>(ns) / 1e6);
+				std::fflush(stdout);
+			}
+		}
+	} miss_timer {options.stage, params.hash, entry != m_program_cache.end()};
+
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
@@ -820,17 +846,44 @@ void PipelineCache::CheckpointDriverCache() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
-	m_driver_cache_dirty = true;
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
-		Save();
+	m_driver_cache_dirty.store(true, std::memory_order_release);
+	const auto now = std::chrono::steady_clock::now();
+	if (now < m_next_driver_cache_save) {
+		return;
+	}
+	m_next_driver_cache_save = now + DriverCacheSaveInterval;
+	// A save still running covers this checkpoint at the next interval (dirty stays set).
+	if (m_driver_cache_saving.load(std::memory_order_acquire)) {
+		return;
+	}
+	JoinDriverCacheSaver();
+	m_driver_cache_saving.store(true, std::memory_order_release);
+	m_driver_cache_saver = std::thread([this] {
+		SaveDriverCache();
+		m_driver_cache_saving.store(false, std::memory_order_release);
+	});
+}
+
+void PipelineCache::JoinDriverCacheSaver() {
+	if (m_driver_cache_saver.joinable()) {
+		m_driver_cache_saver.join();
 	}
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
+	JoinDriverCacheSaver();
+	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+	SaveDriverCache();
+}
+
+void PipelineCache::SaveDriverCache() {
+	if (m_driver_cache == nullptr || !m_driver_cache_dirty.exchange(false, std::memory_order_acq_rel)) {
 		return;
 	}
-	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::DriverCacheSaves,
+	                                         Common::DebugCounters::Counter::DriverCacheSaveNs);
+	// Pipelines created from here on mark the cache dirty again; a failed save restores the flag.
+	const auto failed = [this] { m_driver_cache_dirty.store(true, std::memory_order_release); };
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -852,6 +905,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
 		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
+		failed();
 		return;
 	}
 	payload.resize(size);
@@ -860,6 +914,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+		failed();
 		return;
 	}
 	auto temp_path = m_driver_cache_path;
@@ -881,12 +936,12 @@ void PipelineCache::Save() {
 	if (!written || error) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
+		failed();
 		return;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_driver_cache_dirty = false;
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {

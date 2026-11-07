@@ -260,7 +260,14 @@ private:
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	// Periodic saves run on m_driver_cache_saver: serializing and writing the ~200 MB driver
+	// cache took ~1 s and stalled the GPU thread during menu-to-game loads (dflt-3, 2026-11-07).
+	// VkPipelineCache is internally synchronized, so pipelines keep being created meanwhile.
+	void                          SaveDriverCache();
+	void                          JoinDriverCacheSaver();
+	std::atomic<bool>             m_driver_cache_dirty {false};
+	std::atomic<bool>             m_driver_cache_saving {false};
+	std::thread                   m_driver_cache_saver;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;

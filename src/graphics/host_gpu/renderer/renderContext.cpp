@@ -151,12 +151,42 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		const bool priority =
 		    m_command_scheduler.Active() && m_command_scheduler.HasPendingPriorityOperations();
 		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
-			m_command_scheduler.WaitPriorityOperations(tick);
+		    (priority || m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		     m_texture_cache.IsRegionRegistered(vaddr, size))) {
+			using namespace Common::DebugCounters;
+			// KYTY_UNMAP_DRAIN=priority (or "ab": follows KYTY_AB_PERIOD) drains only for pending
+			// priority operations, the completion callbacks that write guest memory. Cached
+			// buffers and images need no drain: InvalidateMemory downloads GPU-modified buffer data
+			// itself (waiting for its producer), image deletion and image-heap descriptors are
+			// released only after the current tick completes (DeferOperation), and buffers are not
+			// destroyed here. The full drain (default) stalled loading screens ~100 ms per unmap
+			// (wst-2, 2026-11-07).
+			static const int mode = [] {
+				const char* value = std::getenv("KYTY_UNMAP_DRAIN");
+				if (value == nullptr) return 0;
+				if (value[0] == 'p') return 1;
+				return value[0] == 'a' ? 2 : 0;
+			}();
+			const bool narrow = mode == 1 || (mode == 2 && AbVariant());
+			const auto tick   = m_command_scheduler.CurrentTick();
+			if (!narrow) {
+				ScopedTimer timer(Counter::UnmapDrains, Counter::UnmapDrainNs);
+				m_command_scheduler.Finish();
+				m_command_scheduler.WaitPriorityOperations(tick);
+			} else {
+				// Submit what was recorded and wait until the asynchronous recorder has submitted
+				// it too (recording may still read the range), but not for the GPU to execute it:
+				// GPU execution reads only host buffers and images.
+				ScopedTimer timer(Counter::UnmapDrains, Counter::UnmapDrainNs);
+				m_command_scheduler.Flush();
+				m_command_scheduler.GetMasterSemaphore().WaitSubmitted(
+				    m_command_scheduler.CurrentTick() - 1);
+				if (priority) {
+					m_command_scheduler.WaitPriorityOperations(tick);
+				} else {
+					Add(Counter::UnmapDrainsSkipped);
+				}
+			}
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		if (BufferCache::MirrorEnabled() || BufferCache::HostMirrorEnabled()) {
@@ -180,6 +210,8 @@ void RenderContext::PrepareBdaForSubmission() {
 	if (!BufferCache::MirrorEnabled() && !BufferCache::BdaSliceSyncEnabled()) {
 		return;
 	}
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::BdaSliceSyncs,
+	                                         Common::DebugCounters::Counter::BdaSliceSyncNs);
 	m_bda_submission_sync = true;
 	PrepareBda();
 	m_bda_submission_sync = false;

@@ -1308,6 +1308,8 @@ void Presenter::Present(Frame& frame) {
 }
 
 void Presenter::Present(std::span<const Layer> layers) {
+	Common::DebugCounters::ScopedTimer present_timer(Common::DebugCounters::Counter::PresentCalls,
+	                                                 Common::DebugCounters::Counter::PresentNs);
 	Common::LockGuard lock(m_impl->present_mutex);
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
@@ -1372,7 +1374,25 @@ void Presenter::Impl::Present() {
 			auto& master = render_scheduler.GetMasterSemaphore();
 			if (render_tick != 0 && render_tick < render_scheduler.CurrentTick() &&
 			    master.SubmittedTick() < render_tick) {
+				// KYTY_PRESENT_WAIT_SUBMITTED=0 skips this wait (diagnostic, risks the gsamp-2
+				// driver deadlock); "ab" skips it while the A/B variant is off.
+				static const int mode = [] {
+					const char* value = std::getenv("KYTY_PRESENT_WAIT_SUBMITTED");
+					if (value == nullptr) return 1;
+					if (value[0] == 'a') return 2;
+					return value[0] == '0' ? 0 : 1;
+				}();
+				if (mode == 1 || (mode == 2 && Common::DebugCounters::AbVariant())) {
+					Common::DebugCounters::Add(
+					    Common::DebugCounters::Counter::PresentWaitTicksBehind,
+					    render_tick - master.SubmittedTick());
+					Common::DebugCounters::ScopedTimer wait_timer(
+					    Common::DebugCounters::Counter::PresentWaitSubmitted,
+					    Common::DebugCounters::Counter::PresentWaitSubmittedNs);
 					master.WaitSubmitted(render_tick);
+				} else {
+					Common::DebugCounters::Add(Common::DebugCounters::Counter::PresentWaitSkipped);
+				}
 			}
 		}
 		const auto tick = swapchain.Submit(

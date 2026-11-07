@@ -84,7 +84,26 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		gpu_thread_timer.emplace(Common::DebugCounters::Counter::GpuThreadWaits,
 		                         Common::DebugCounters::Counter::GpuThreadWaitNs);
 	}
+	// KYTY_WAIT_STACKS_MS=<ms>: print the caller stack of GPU-thread waits longer than that
+	// (first 80), to find what the GPU thread waits for.
+	static const int long_wait_ms = [] {
+		const char* value = std::getenv("KYTY_WAIT_STACKS_MS");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	const auto wait_begin = std::chrono::steady_clock::now();
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	if (long_wait_ms > 0 && GuestGpu::IsGpuThread()) {
+		const auto waited = std::chrono::duration<double, std::milli>(
+		                        std::chrono::steady_clock::now() - wait_begin)
+		                        .count();
+		static std::atomic<uint32_t> printed {0};
+		if (waited >= long_wait_ms && printed.fetch_add(1, std::memory_order_relaxed) < 80u) {
+			std::printf("long gpu wait: %.1f ms tick %llu (known %llu)\n", waited,
+			            static_cast<unsigned long long>(tick),
+			            static_cast<unsigned long long>(KnownGpuTick()));
+			Common::ThreadSampler::PrintCurrentStack("  long gpu wait stack");
+		}
+	}
 	if (result != vk::Result::eSuccess) {
 		ReportGpuCheckpoints(m_graphics);
 	}

@@ -133,6 +133,25 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::i
 	X(RbWriteProducerAgeTicks) \
 	X(SideReadbacks) /* downloads on the side queue (producer already submitted) */ \
 	X(SideReadbackNs) \
+	/* Waits for a tick to be submitted by the recording worker (MasterSemaphore::WaitSubmitted); */ \
+	/* counted only when the tick was not submitted yet. TicksBehind sums the shortfall. */ \
+	X(SideWaitSubmitted) \
+	X(SideWaitSubmittedNs) \
+	X(PresentWaitSubmitted) \
+	X(PresentWaitSubmittedNs) \
+	X(PresentWaitTicksBehind) \
+	X(PresentWaitSkipped) /* KYTY_PRESENT_WAIT_SUBMITTED=0/ab skipped a needed wait */ \
+	X(PresentCalls) /* Presenter::Present, whole call (presenter thread) */ \
+	X(PresentNs) \
+	X(BdaSliceSyncs) /* RenderContext::PrepareBdaForSubmission (GPU thread, outside Pm4ProcessNs) */ \
+	X(BdaSliceSyncNs) \
+	X(DriverCacheSaves) /* Vulkan driver pipeline cache written to disk (background thread) */ \
+	X(DriverCacheSaveNs) \
+	X(ProgramMisses) /* PipelineCache::GetProgram misses: prepare + translate + compile */ \
+	X(ProgramMissNs) \
+	X(UnmapDrains) /* RenderContext::UnmapMemory waits (GPU thread) */ \
+	X(UnmapDrainNs) \
+	X(UnmapDrainsSkipped) /* KYTY_UNMAP_DRAIN=priority: drains the old rule would have made */ \
 	X(WriteFaultSyncCalls) \
 	X(WriteFaultSyncNs) \
 	X(WriteFaultDownloadCalls) \

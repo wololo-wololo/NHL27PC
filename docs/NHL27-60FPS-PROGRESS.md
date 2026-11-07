@@ -2,6 +2,68 @@
 
 Last updated: 2026-11-07 (Europe/Berlin)
 
+## Session 2026-11-07, part 11: on-ice "regression", menu-to-game transition
+
+The user also asked for a steady 30 during the menu-to-game transition ("breaks down quite a lot").
+
+- **Part 10's slower end-of-session build is not a code regression.** New counters (`SideWaitSubmitted*`,
+  `PresentWaitSubmitted*`, `PresentWaitTicksBehind`, `PresentCalls/PresentNs`, `BdaSliceSyncs/Ns`) and
+  `KYTY_PRESENT_WAIT_SUBMITTED=0|ab` (skip the presenter's wait; diagnostic only). `pwab-1` (in-run A/B
+  of the presenter wait, slice sync held on with the new `KYTY_BDA_SLICE_SYNC=fixed`): the presenter
+  wait **never fires** on ice (0/s), side-queue waits cost 0.9 ms/s, and on-ice play ran **31 flips/s**
+  in both phases, faster than both `asst` (29.5) and `sl30` (27.8). Treat `sl30` as batch variance.
+  - Correction to part 10: slice sync costs `BdaSliceSyncNs` ≈ 43 ms/s (1,650 slices/s), which sits
+    outside `Pm4ProcessNs`, so `bdas-1`'s "+11% draws per GPU-thread ms" is overstated. The net saving
+    is ~33 ms/s (`BindBdaNs` 76 → 3 minus 43). Still a win; it stays on.
+- **Transition timeline (tools `timeline.py`, `phasecost.py`, `cmpgroups.py`).** Perf time, warm cache:
+  start-game screen ~t 38, loading screen ~t 40–44, loading scene t 45–57 (~5,000 draws/frame,
+  21–25 FPS), arena load t 58–66 (~2,500 draws, 23–28 FPS, 6–9 GB/s texture uploads), intro after the
+  skip taps t 72–96 (5,000–6,800 draws, **14–17 FPS**), lineup to ~t 104, then on-ice 30.
+- **Fixed: ~1 s hitches from the Vulkan driver pipeline-cache save.** `PipelineCache::Save` ran on the
+  GPU thread whenever any new pipeline appeared since the last save (every 30 s at most):
+  `vkGetPipelineCacheData` of ~204 MB, XXH3, write and flush. Three per warm transition (`dflt-3`:
+  `DrawPipelineNs` 1,012 ms at t 40 and 1,282 ms at t 89, a 698 ms dispatch at t 67), shown as 0–14
+  FPS seconds. `PipelineCreateNs` never saw it (it times `CreatePipelineInternal` only). Periodic saves
+  now run on a background thread (`m_driver_cache_saver`; `VkPipelineCache` is internally synchronized,
+  and warm-up already creates pipelines from 8 threads); `Save()` (shutdown) joins it and saves
+  synchronously; the dirty flag is cleared before the data is read. Counters `DriverCacheSaves/DriverCacheSaveNs`.
+  Warm `pcs-2`, `pmiss-2`: worst `DrawPipelineNs` second 6 ms; saves take ~620 ms on their thread.
+  Rendering correct.
+- **Diagnostics added:** `ProgramMisses/ProgramMissNs` and a `Program miss: <stage> <hash>
+  new-program|new-variant <ms>` line for misses ≥ 20 ms (`KYTY_LOG_PROGRAM_MISSES=0` silences). Warm
+  `pmiss-2`: 38 misses, 259 ms total, the worst a 119 ms pixel shader. Not a hitch source when warm.
+  `KYTY_WAIT_STACKS_MS=<ms>` prints the stack of every GPU-thread semaphore wait longer than that
+  (first 80).
+- **Loading screen (~3 s at 5–20 FPS, t ~40–44) is not fixed.** GPU-thread waits on the GPU
+  (`GpuThreadWaitNs`) reach 250–430 ms/s against ~20 on ice; ~1,100 image creates/s; 800+ CPU-side
+  texture uploads/s; guest faults 700 ms/s. `wst-2` wait stacks: most long waits are
+  `RenderContext::UnmapMemory` → `CommandScheduler::Finish`. The game unmaps ~70 ranges/s while
+  loading, and any cached buffer or image in the range (or any pending priority operation) drains the
+  whole GPU.
+  - Tried, opt-in: `KYTY_UNMAP_DRAIN=priority|ab`. It flushes, waits only until the asynchronous
+    recorder has *submitted* (recording may still read the range), and waits for priority operations
+    only if some are pending. Image/heap deletions are already deferred to tick completion. Load window
+    `UnmapDrainNs` 762 → 381–601 ms, but flips there barely changed, and 1 of 4 runs crashed: the
+    first version (no recorder wait) in `ud-prio-1`; `ud2-prio-2` died 2 s after boot in guest code,
+    probably unrelated. Not default.
+- **Crash class seen today:** `ntdll+0x20191`/`+0x1ff2a` near-null reads on a thread running on a
+  guest stack (`rsp` 0xffa9…). In `dflt-1`/`wst-1` it follows the game's own "GPU Stopped Working"
+  breadcrumb report (the game's GPU watchdog after long stalls). It looks like ntdll's exception
+  dispatch walking a guest stack after a fault the emulator's handler did not claim; the original fault
+  is lost. The thread sampler now limits *all* walks to the emulator image (it used to look up JIT
+  addresses for the GPU thread; `gsamp-1` was the same pc from the sampler).
+- **Next steps, in order:**
+  1. The draw-heavy intro/lineup (25 s at 14–17 FPS, 5,000–6,800 draws per frame at the same
+     ~7 µs/draw as on ice) is the main remaining transition gap. Steady 30 there needs per-draw cost
+     roughly halved: the same work as the on-ice whistle/faceoff bursts (part 9: draw-preparation
+     pipeline or GPU-side descriptors).
+  2. Loading screen: find the rest of the GPU-thread GPU waits (`KYTY_WAIT_STACKS_MS=15`, warm
+     run), and why 800+ CPU texture uploads/s happen. Before narrowing unmap drains further, capture
+     the original fault behind the ntdll crash (log first-chance faults the handler declines on
+     guest-stack threads).
+  3. Part 10's steady-30 on-ice items stay open (eager publish of re-read GPU ranges, hot write-fault
+     pages, image reuse).
+
 ## Session 2026-11-07, part 10: toward a steady 30
 
 The user chose "steady 30 first" after part 9.

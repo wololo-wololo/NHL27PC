@@ -315,7 +315,12 @@ bool BufferCache::DownloadOnSideQueue(Buffer& buffer, uint64_t vaddr, uint64_t s
 	// The semaphore wait orders the copy after the producer and makes its writes visible. The
 	// producer was handed to the submitter (wait_tick < CurrentTick); wait until it really was
 	// submitted (asynchronous recording), so this is never a wait-before-signal submit.
+	if (m_scheduler.GetMasterSemaphore().SubmittedTick() < wait_tick) {
+		Common::DebugCounters::ScopedTimer wait_timer(
+		    Common::DebugCounters::Counter::SideWaitSubmitted,
+		    Common::DebugCounters::Counter::SideWaitSubmittedNs);
 		m_scheduler.GetMasterSemaphore().WaitSubmitted(wait_tick);
+	}
 	const auto                   semaphore  = m_scheduler.GetMasterSemaphore().Handle();
 	const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
 	vk::TimelineSemaphoreSubmitInfo timeline {};
