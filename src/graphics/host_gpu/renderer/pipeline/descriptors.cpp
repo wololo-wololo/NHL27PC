@@ -476,7 +476,7 @@ bool TextureMemoEnabled() {
 		const char* value = std::getenv("KYTY_TEXTURE_MEMO");
 		return value == nullptr || value[0] != '0';
 	}();
-	return enabled && Common::DebugCounters::AbVariant();
+	return enabled && Common::DebugCounters::AbVariantFor("texmemo");
 }
 
 bool TextureMemoVerify() {

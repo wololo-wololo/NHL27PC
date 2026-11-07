@@ -2,6 +2,8 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "graphics/host_gpu/renderer/pipeline/prewalk.h"
+#include "graphics/host_gpu/sliceWriteLog.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -525,6 +527,11 @@ bool GuestGpu::Process(Submission& submission) {
 		// Every slice: a command buffer paused on a CPU-written label may resume reading data
 		// the CPU wrote meanwhile.
 		m_renderer.PrepareBdaForSubmission();
+		SliceWriteLog::Begin();
+		if (Prewalk::Enabled()) {
+			Prewalk::BeginSlice(cp, m_renderer,
+			                    CommandProcessor::PendingBuffers(submission.execution, submission.commands));
+		}
 	}
 	bool complete = true;
 

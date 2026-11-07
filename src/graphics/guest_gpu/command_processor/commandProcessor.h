@@ -114,6 +114,19 @@ public:
 	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
+	// PM4 still to run in a slice, innermost buffer last (look-ahead materialization).
+	[[nodiscard]] static std::vector<std::span<const uint32_t>>
+	PendingBuffers(const Pm4Execution& execution, std::span<const uint32_t> commands) {
+		std::vector<std::span<const uint32_t>> pending;
+		if (execution.m_buffer_stack.empty()) {
+			if (!commands.empty()) pending.push_back(commands);
+			return pending;
+		}
+		for (const auto& cursor: execution.m_buffer_stack) {
+			pending.push_back(cursor.commands.subspan(std::min<size_t>(cursor.offset_dw, cursor.commands.size())));
+		}
+		return pending;
+	}
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
 
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }

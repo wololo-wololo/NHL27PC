@@ -77,7 +77,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	std::array<uint8_t, sizeof(HW::RenderTarget)> regs {};
 	std::memcpy(regs.data(), &rt, sizeof(rt));
 	const auto raw_mask = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
-	if (memo_enabled && Common::DebugCounters::AbVariant() && rt_slot < memos.size()) {
+	if (memo_enabled && Common::DebugCounters::AbVariantFor("rtmemo") && rt_slot < memos.size()) {
 		auto& memo = memos[rt_slot];
 		if (memo.valid && memo.mask == raw_mask && memo.slice_offset == render_target_slice_offset &&
 		    memo.ignore == ignore_target_mask && memo.exact == exact_format && memo.regs == regs) {
@@ -126,7 +126,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			memo.result = before_lookup;
 		}
 	} store {r, regs, raw_mask, render_target_slice_offset, rt_slot, ignore_target_mask, exact_format,
-	         memo_enabled && Common::DebugCounters::AbVariant()};
+	         memo_enabled && Common::DebugCounters::AbVariantFor("rtmemo")};
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
 	}

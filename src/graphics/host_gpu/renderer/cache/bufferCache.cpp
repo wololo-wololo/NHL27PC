@@ -1386,7 +1386,7 @@ bool BufferCache::BdaSliceSyncEnabled() {
 		if (value[0] == 'f') return 2;
 		return value[0] == '0' ? 0 : 1;
 	}();
-	return mode == 2 || (mode == 1 && Common::DebugCounters::AbVariant());
+	return mode == 2 || (mode == 1 && Common::DebugCounters::AbVariantFor("bdaslice"));
 }
 
 RangeSet BufferCache::TakeBdaSync(bool all) {

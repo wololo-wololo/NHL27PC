@@ -2,6 +2,129 @@
 
 Last updated: 2026-11-07 (Europe/Berlin)
 
+## Session 2026-11-07, part 14 (newest): look-ahead materialization helper (built, on by default)
+
+The user chose "build the helper" after the part-13 feasibility result.
+
+- **What it does (`host_gpu/renderer/pipeline/prewalk.h`, `guest_gpu/command_processor/prewalk.cpp`;
+  on, `KYTY_PREWALK=0` disables):**
+  - At every graphics/compute slice start (`GuestGpu::Process`) the GPU thread copies the command
+    processor's `HW::Shader` registers and the PM4 still to run (`CommandProcessor::PendingBuffers`)
+    into one of three batches and posts it; it never waits for the helper.
+  - The helper thread replays `SET_SH_REG`/`SET_SH_REG_INDIRECT` on a shadow `CommandProcessor`
+    (the real handlers; register tables read with `TryReadBacking` after checking no page is
+    GPU-modified, then handed over as a host copy), follows `INDIRECT_BUFFER` calls/chains
+    (`RenderContext::IsMapped` first), mirrors `R_DISPATCH_RESET`, and stops at branches,
+    `COND_EXEC`, `REWIND`, flip waits and unsatisfied waits. A `WAIT_REG_MEM` already satisfied
+    is passed (the signaller's earlier writes are visible), and so is an unsatisfied one whose
+    label an earlier packet of the same scan writes (`RELEASE_MEM`, `WRITE_DATA`, `COPY_DATA`,
+    `DMA_DATA`, `EVENT_WRITE`): a GPU-internal fence; if it suspends, the batch dies with the slice.
+  - At each draw (vertex and pixel program) and direct dispatch it looks up the program the GPU
+    thread last used for that stage and code address (`Prewalk::Publish` from `GetProgram`, with
+    its user-data count and merged-stage prefix) and materializes it (`MaterializeResources`) with
+    its own walker scratch (`SetSrtScratchOverride`; `WalkSrtNs` stays GPU-thread time), recording
+    walker captures. Post-walk reads use `TryReadBacking`; any of those on a GPU-modified page drops
+    the result (walker loads there fault and abort the job, as in part 3).
+  - `Program::Materialize` first calls `Prewalk::Take`: in a 24-entry window past its cursor it
+    looks for a ready result with the same program, shader base and user data whose recorded reads
+    miss the slice write log (`sliceWriteLog.h`, now merged ranges), and swaps it in.
+  - `KYTY_PREWALK_VERIFY=1` recomputes every taken result and compares snapshot and
+    specialization; `KYTY_PREWALK_DIAGNOSE=1` prints mispredicted user data.
+- **Bugs found on the way:** `TryReadBufferBacking` refuses GPU-visible memory off the GPU thread
+  (and on it first downloads GPU-written bytes), so the helper must use `TryReadBacking` plus its
+  own dirty check; slices resumed after a wait start with that wait; `RELEASE_MEM` is 8 dwords.
+- **Correctness:** verify runs `pw-v1..v7`: **26.8 M taken results, 0 mismatches**; no crash
+  attributable to the helper in 13 runs (`pw-ab3` hit the known rare boot abort
+  `unsupported render-target format combination: layout=0 type=0 order=0`, seen before the helper
+  existed). Rendering correct in all screenshots.
+- **Hit rate (`tools/perf/prewalkrun.py`):** 50% of GPU-thread materializations in the intro, 58%
+  in its heavy seconds. Misses: nothing produced past the cursor (scan stopped or the program is
+  not predicted, e.g. LS/HS), compute dispatches of the same program with other user data,
+  `DISPATCH_INDIRECT` (never taken), first use of a program.
+- **Performance, clean in-run A/B (`KYTY_AB_PERIOD=3 KYTY_AB_TARGET=prewalk`, new
+  `KYTY_AB_TARGET` keeps the other A/B features on; tool `tools/perf/abphases.py`), `pw-ab4`:**
+
+  | Window | Per draw, off → on | Materialization, off → on | FPS, off → on |
+  |---|---|---|---|
+  | Intro t 60–106 | 5.96 → 5.25 µs (−12%) | 239 → 176 ms/s | 22.6 → 24.4 |
+  | Heavy seconds | 5.95 → 5.44 µs (−9%) | 257 → 195 ms/s | 16.0 → 17.7 |
+  | Early play | 6.41 → 5.74 µs (−10%) | 267 → 205 ms/s | 30.6 → 33.7 |
+
+  `pw-ab2` (before the narrower dirty check) agreed: −8 to −11% per draw, +0–2 FPS. The helper
+  costs ~300–400 ms/s of one core. Game threads' readback waits (`BufferReadSyncNs`) rise ~50 ms/s
+  and fault time ~60 ms/s with it on; most likely the GPU thread reaching readbacks sooner, not
+  verified.
+  - Earlier part-12/13 A/Bs that used `KYTY_AB_PERIOD` alone toggled every A/B feature at once
+    (BDA slice sync, texture memo, RT memo, helper); use `KYTY_AB_TARGET` from now on.
+- **Still not a steady 30 in the heavy intro (~17–18 FPS).** The helper took ~60 ms/s off the GPU
+  thread there; the rest of a draw (bindings, buffer sync, commit) is unchanged.
+- **Next steps:**
+  1. Raise the hit rate: keep scanning into the next queued submission with the predicted
+     register state; predict LS/HS/tessellation stages; skip pixel jobs for draws without a pixel
+     stage (wasted helper work).
+  2. Find out why game threads' readback waits rise with the helper (`BufferReadSync*` by caller),
+     and whether pinning the helper away from the GPU thread's core matters.
+  3. The other per-draw items (part 12 steps 2–3): buffer sync per binding, hot write-fault pages.
+
+## Session 2026-11-07, part 13: look-ahead materialization, feasibility
+
+The user asked to attack the GPU-thread bound in the intro directly and chose the look-ahead
+materialization project.
+
+- **The gap (heavy intro seconds, `p12-1`/`p12-2` counters):** the GPU thread needs ~49 ms per
+  frame (5,300 draws, 1,700 dispatches); 30 FPS needs ≤ 33. Per frame: materialization ~15 ms
+  (walker ~12), bindings/buffer sync ~8.5, dispatches ~8.5, readbacks ~7.8 (side 5.1 + GPU
+  thread 2.7), page protection 5, slice BDA sync 2.75, the rest small. Only materialization is a
+  single item big enough, and it only reads guest memory.
+- **Idea:** a helper thread runs each submission slice's PM4 ahead of the GPU thread, tracks the
+  shader registers (mostly `SET_SH_REG_INDIRECT`, ~650k packets/s) and materializes the upcoming
+  draws' and dispatches' resources; the GPU thread takes a result only if its inputs match (plan,
+  user data, shader base) and nothing the GPU thread did in the slice so far changed memory the
+  result read. CPU writes during a slice cannot matter: the guest can rely only on CPU writes made
+  before it submitted or before a label the command buffer waits on, which ends a slice (part 10).
+- **Probe built (`KYTY_PREWALK_PROBE=1`, off by default; tool `tools/perf/prewalk.py`).**
+  `host_gpu/sliceWriteLog.h` logs, per slice and on the GPU thread only, the 4 KiB pages it
+  changes: ranges registered GPU-written (`MemoryTracker::MarkRegionAsGpuModified`/`Unmark…`,
+  written uploads), downloads into guest memory (`ForEachDownloadRange`), texture GPU writes
+  (`MarkGpuWritten`, `InvalidateMemoryFromGPU`) and PM4 memory writes (`WRITE_DATA`, `COPY_DATA`,
+  `DMA_DATA`, `RELEASE_MEM`, `MEM_SEMAPHORE`, `EVENT_WRITE` dumps). Every real materialization is
+  classified: would a walk at slice start have given the same result (no walker fault, no
+  captured or recorded read on a changed page)? Counters `Prewalk*`.
+- **Result (`pwp-1..3`, 0 crashes), share of materialization time:**
+
+  | Window | Plain plans valid | Captured-read plans valid | Fault | Read changed in slice | Captured-read plans invalid |
+  |---|---|---|---|---|---|
+  | Menus | 19% | 45% | 5.3% | 1.5% | 29% |
+  | Intro t 70–106 | 31% | 55% | 0.5% | 0.9% | 13% |
+  | Heavy seconds | 33% | **51%** | 0.5% | 0.9% | 15% |
+  | Early play | 34% | 49% | 0.1% | 0.5% | 16% |
+
+  - The only reason plans were excluded from the part-3 helper was `capture_specialization_reads`
+    (descriptor words fetched with buffer loads); no indirect descriptors, call sources or selector
+    keys in these scenes. Those plans' walk and post-walk reads (`TryReadBufferBacking`, plain
+    non-faulting reads) are all recorded in `specialization_reads`, so they can be validated the
+    same way. Only indirect descriptors touch GPU-thread state (the image heap).
+  - **~84% of materialization time in the heavy seconds would be valid from a slice-start helper**
+    (~12.5 of ~15 ms per frame). If it all moved off the thread: ~49 → ~36.5 ms per frame, ~27
+    FPS there, before helper overhead and before input mispredictions (not measured yet).
+  - Open: why ~15% of captured-read plan time reads pages changed in the slice (a real
+    dependency on GPU-written constants, or an over-broad log entry such as a large written
+    buffer range).
+- **Design for the helper (next session):**
+  1. Look-ahead register tracker on the helper: replays a slice's PM4 for SH registers only
+     (`SET_SH_REG`, `SET_SH_REG_INDIRECT`, `CLEAR_STATE`, `INDIRECT_BUFFER` chains), stopping at
+     packets it cannot follow (`COND_EXEC`, predication, `WAIT_REG_MEM`); per draw/dispatch it
+     emits (stage, shader address, user data). Static program keys depend on context registers,
+     so the helper looks plans up by (stage, shader hash/address) from a table the GPU thread
+     publishes, and the GPU thread checks the plan pointer on use.
+  2. Materialize on the helper into per-draw result slots (snapshot + specialization +
+     recorded reads), walker loads in helper mode (faults abort), no buffer/texture cache access.
+  3. On the GPU thread: take the slot if plan, user data and shader base match and none of its
+     recorded reads is on a page the slice log has; otherwise materialize as today.
+     `KYTY_PREWALK_VERIFY=1` recomputes and compares every taken result.
+  4. Measure helper overhead against the 8-core CPU (part 3 lost its gain to a spinning helper
+     and slower draws); the helper should block per slice, not per draw.
+
 ## Session 2026-11-07, part 12: per-draw cost in the draw-heavy intro
 
 The user chose "per-draw cost work" after part 11 (goal: the 14–17 FPS intro/lineup at 5–7k draws

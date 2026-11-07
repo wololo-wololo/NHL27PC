@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/sliceWriteLog.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
@@ -1496,6 +1497,7 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 		EXIT("unsupported 64-bit immediate copyData\n");
 	}
 
+	SliceWriteLog::Note(dst, num_bytes);
 	cp.DmaData(0, CopyDataDstToDma(dst_sel), dst_cache, dst, dma_src, src_cache, src, num_bytes, 1,
 	           write_confirm, 1);
 
@@ -1527,6 +1529,7 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 	const uint8_t  wait_previous = static_cast<uint8_t>((control2 >> 30u) & 0x1u);
 	const uint8_t  write_confirm = static_cast<uint8_t>((control2 >> 31u) & 0x1u);
 	const uint32_t num_bytes     = control2 & 0x03ffffffu;
+	SliceWriteLog::Note(dst, num_bytes);
 
 	cp.DmaData(engine, dst_sel, dst_cache_policy, dst, src_sel, src_cache_policy, src, num_bytes,
 	           wait_previous, write_confirm, block_engine);
@@ -1695,6 +1698,7 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 		event_address = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
 	}
 
+	if (event_address != 0) SliceWriteLog::Note(event_address, 64u); // counter dumps
 	cp.TriggerEvent(event_type, event_index, event_address);
 
 	return packet_size_dw - 1u;
@@ -2085,6 +2089,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	// The event type, cache actions and destination cache only order GPU work, which the renderer's
 	// resource barriers already order.
+	SliceWriteLog::Note((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u), 8u);
 	cp.ReleaseMem(
 	    (buffer[1] >> 29u) & 0x7u, (buffer[1] >> 24u) & 0x7u,
 	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
@@ -2103,6 +2108,7 @@ KYTY_CP_OP_PARSER(CpOpMemSemaphore) {
 	auto* counter = reinterpret_cast<uint64_t*>(
 	    (buffer[0] & ~0x7u) | (static_cast<uint64_t>(buffer[1] & 0x3ffffu) << 32u));
 	// A signal updates the counter before the next packet, so its mailbox stall never waits.
+	SliceWriteLog::Note(reinterpret_cast<uint64_t>(counter), 8u);
 	cp.MemSemaphore(counter, (control >> 29u) == 6u, ((control >> 20u) & 0x1u) != 0);
 
 	return 3;
@@ -2336,6 +2342,7 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 	auto  write_control = buffer[0];
 	auto* dst = reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
 
+	SliceWriteLog::Note(reinterpret_cast<uint64_t>(dst), uint64_t {dw_num - 2u} * 4u);
 	cp.WriteData(dst, buffer + 3, dw_num - 2, write_control);
 
 	return 1 + dw_num;

@@ -4,6 +4,8 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "graphics/host_gpu/renderer/pipeline/prewalk.h"
+#include "graphics/host_gpu/sliceWriteLog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -306,9 +308,13 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 	return nullptr;
 }
 
+static bool HelperEligible(const ShaderRecompiler::IR::ResourcePlan& plan);
 
 void PipelineCache::Program::Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime) {
-	const bool profile          = Common::DebugCounters::Enabled();
+	if (Prewalk::Take(*this, runtime)) return;
+	const bool probe = SliceWriteLog::ProbeEnabled();
+	if (probe) ShaderRecompiler::IR::ResetWalkProbe();
+	const bool profile          = Common::DebugCounters::Enabled() || probe;
 	const auto exceptions_before = Common::DebugCounters::t_host_exceptions;
 	const auto materialize_begin =
 	    profile ? Common::DebugCounters::FastClock::now() : Common::DebugCounters::FastClock::time_point {};
@@ -327,6 +333,60 @@ void PipelineCache::Program::Materialize(const ShaderRecompiler::IR::SrtRuntime&
 			Common::DebugCounters::Add(Counter::MaterializeFaultNs, ns);
 		} else {
 			Common::DebugCounters::Add(Counter::MaterializeCleanNs, ns);
+		}
+		if (probe) {
+			// Would a walk at the start of this submission slice (a look-ahead helper) have
+			// produced this result? Inputs (plan, user data) are assumed predictable here.
+			Counter count = Counter::PrewalkValid, time = Counter::PrewalkValidNs;
+			// Captured-read plans list every address their walk and post-walk reads touched.
+			const bool captured = resource_plan.capture_specialization_reads &&
+			                      resource_plan.resource_tracking_complete &&
+			                      resource_plan.srt_code != nullptr &&
+			                      resource_plan.source_reads.empty() &&
+			                      resource_plan.selector_keys.empty() &&
+			                      ShaderRecompiler::IR::WalkProbeWalked();
+			bool captured_written = false;
+			if (captured) {
+				for (const auto& [address, size]: resources.specialization_reads) {
+					if (size == 0) continue;
+					for (uint64_t page = address >> 12u; page <= (address + size - 1u) >> 12u; ++page) {
+						captured_written |= SliceWriteLog::PageWritten(page);
+					}
+					if (captured_written) break;
+				}
+			}
+			if (captured) {
+				Common::DebugCounters::Add(Counter::PrewalkCapturedPlans);
+				if (exceptions == 0 && !captured_written &&
+				    !ShaderRecompiler::IR::WalkProbeReadSliceWrites()) {
+					Common::DebugCounters::Add(Counter::PrewalkCapturedValidNs, ns);
+				}
+			}
+			if (!HelperEligible(resource_plan) || !ShaderRecompiler::IR::WalkProbeWalked()) {
+				count = Counter::PrewalkIneligible;
+				time  = Counter::PrewalkIneligibleNs;
+				const auto& plan = resource_plan;
+				Counter reason   = Counter::PrewalkIndirectNs;
+				if (!plan.resource_tracking_complete || plan.srt_code == nullptr ||
+				    !ShaderRecompiler::IR::WalkProbeWalked()) {
+					reason = Counter::PrewalkNoWalkerNs;
+				} else if (plan.capture_specialization_reads) {
+					reason = Counter::PrewalkCapturedReadsNs;
+				} else if (!plan.source_reads.empty()) {
+					reason = Counter::PrewalkSourceReadsNs;
+				} else if (!plan.selector_keys.empty()) {
+					reason = Counter::PrewalkSelectorKeysNs;
+				}
+				Common::DebugCounters::Add(reason, ns);
+			} else if (exceptions != 0) {
+				count = Counter::PrewalkFaulted;
+				time  = Counter::PrewalkFaultedNs;
+			} else if (ShaderRecompiler::IR::WalkProbeReadSliceWrites()) {
+				count = Counter::PrewalkSliceWritten;
+				time  = Counter::PrewalkSliceWrittenNs;
+			}
+			Common::DebugCounters::Add(count);
+			Common::DebugCounters::Add(time, ns);
 		}
 	}
 }
@@ -444,6 +504,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
 		module.info.bindings.AdvancePushData(push_data_cursor);
+		if (Prewalk::Enabled()) {
+			// The look-ahead helper predicts later draws' programs of this stage and address.
+			if (options.stage == ShaderType::Pixel) {
+				Prewalk::Publish(Prewalk::Stage::Pixel, entry->second, params);
+			} else if (options.stage == ShaderType::Compute) {
+				Prewalk::Publish(Prewalk::Stage::Compute, entry->second, params);
+			} else if (options.stage == ShaderType::Vertex || options.stage == ShaderType::Mesh) {
+				Prewalk::Publish(Prewalk::Stage::Vertex, entry->second, params);
+			}
+		}
 		return &module;
 	};
 	bool source_changed = false;

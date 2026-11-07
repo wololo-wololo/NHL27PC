@@ -204,9 +204,7 @@ public:
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
-private:
-	friend struct PipelineCacheTestAccess;
-
+	// Public for the look-ahead materialization helper (prewalk.h), which fills programs' resources.
 	struct Program {
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;

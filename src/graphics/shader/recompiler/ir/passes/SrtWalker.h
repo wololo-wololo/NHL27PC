@@ -97,6 +97,17 @@ uint32_t SrtWalkerHelperAbort(uint64_t rip);
 // Whether a walker load faulted on this helper thread since the last call; clears the flag.
 bool TakeSrtWalkerHelperAborted();
 
+// This thread's walks use `scratch` (at least plan.srt_scratch.size() words) instead of the plan's
+// own, and append every captured read address to `captures` (both may be null: the plan's scratch,
+// no sink). For the look-ahead helper, which walks plans concurrently with the GPU thread.
+void SetSrtScratchOverride(uint64_t* scratch, std::vector<std::pair<uint64_t, uint64_t>>* captures);
+
+// KYTY_PREWALK_PROBE=1 (see host_gpu/sliceWriteLog.h): whether a walk ran since the reset, and
+// whether one read a page the GPU thread changed earlier in the current submission slice.
+void ResetWalkProbe();
+[[nodiscard]] bool WalkProbeWalked();
+[[nodiscard]] bool WalkProbeReadSliceWrites();
+
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
 template <size_t Size>

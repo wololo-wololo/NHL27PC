@@ -3,6 +3,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "graphics/host_gpu/sliceWriteLog.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
@@ -176,8 +177,17 @@ uint32_t OutputOffset(const ResourcePlan& plan) {
 	return (ActiveOffset(plan) + static_cast<uint32_t>(active) + 7u) & ~7u;
 }
 
+// The look-ahead helper (part 13) walks plans concurrently with the GPU thread, so it brings its
+// own scratch (SetSrtScratchOverride); everyone else uses the plan's.
+thread_local uint64_t*                                   t_scratch_override = nullptr;
+thread_local std::vector<std::pair<uint64_t, uint64_t>>* t_capture_sink     = nullptr;
+
+uint64_t* ScratchWords(const ResourcePlan& plan) {
+	return t_scratch_override != nullptr ? t_scratch_override : plan.srt_scratch.data();
+}
+
 const uint8_t* Scratch(const ResourcePlan& plan) {
-	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
+	return reinterpret_cast<const uint8_t*>(ScratchWords(plan));
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
@@ -1987,7 +1997,7 @@ static void VerifyWalk(const ResourcePlan& plan, const SrtRuntime& runtime,
 		const auto active = ActiveOffset(plan);
 		if (why.empty() && std::memcmp(now + active, then + active, reference->values_end - active) != 0)
 			why = "activity or outputs";
-		const auto* captures_now  = plan.srt_scratch.data() + plan.srt_captures / 8u;
+		const auto* captures_now  = ScratchWords(plan) + plan.srt_captures / 8u;
 		const auto* captures_then = scratch.data() + reference->captures / 8u;
 		if (why.empty() && (end - captures_now != ref_end - captures_then ||
 		                    !std::equal(captures_now, end, captures_then)))
@@ -2006,16 +2016,36 @@ static void VerifyWalk(const ResourcePlan& plan, const SrtRuntime& runtime,
 	}
 }
 
+namespace {
+thread_local bool t_probe_walked  = false;
+thread_local bool t_probe_written = false;
+} // namespace
+
+void ResetWalkProbe() {
+	t_probe_walked  = false;
+	t_probe_written = false;
+}
+
+bool WalkProbeWalked() {
+	return t_probe_walked;
+}
+
+bool WalkProbeReadSliceWrites() {
+	return t_probe_written;
+}
+
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
-	Common::DebugCounters::StageTimer walk_timer(Common::DebugCounters::Counter::WalkSrtNs);
-	const bool stats = WalkStatsEnv() != nullptr;
+	// WalkSrtNs stays GPU-thread time: look-ahead helper walks (scratch override) are not counted.
+	std::optional<Common::DebugCounters::StageTimer> walk_timer;
+	if (t_scratch_override == nullptr) walk_timer.emplace(Common::DebugCounters::Counter::WalkSrtNs);
+	const bool stats = WalkStatsEnv() != nullptr && t_scratch_override == nullptr;
 	const auto walk_begin = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	t_running_walker = plan.srt_code.get();
-	auto* const scratch = plan.srt_scratch.data();
+	auto* const scratch = ScratchWords(plan);
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     scratch, runtime.shader_base);
 	t_running_walker = nullptr;
@@ -2035,12 +2065,36 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 		RecordWalk(plan, walk_ns, warm_ns, runtime.user_data, flat, end);
 	}
 	if (WalkerVerifyEnabled()) VerifyWalk(plan, runtime, flat, end);
+	if (SliceWriteLog::ProbeEnabled() && t_scratch_override == nullptr) {
+		t_probe_walked = true;
+		if (end != nullptr) {
+			uint64_t last_page = UINT64_MAX;
+			for (const auto* read = scratch + plan.srt_captures / 8u; read != end; ++read) {
+				const auto page = *read >> 12u;
+				if (page == last_page) continue;
+				last_page = page;
+				if (SliceWriteLog::PageWritten(page)) {
+					t_probe_written = true;
+					break;
+				}
+			}
+		}
+	}
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
 		for (auto* read = scratch + plan.srt_captures / 8u; read != end; ++read)
 			reads->emplace_back(*read, sizeof(uint32_t));
 	}
+	if (t_capture_sink != nullptr) {
+		for (auto* read = scratch + plan.srt_captures / 8u; read != end; ++read)
+			t_capture_sink->emplace_back(*read, sizeof(uint32_t));
+	}
 	return true;
+}
+
+void SetSrtScratchOverride(uint64_t* scratch, std::vector<std::pair<uint64_t, uint64_t>>* captures) {
+	t_scratch_override = scratch;
+	t_capture_sink     = captures;
 }
 
 void SrtScratchLayout(const ResourcePlan& plan, uint32_t& active_offset, uint32_t& output_offset) {

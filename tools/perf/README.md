@@ -26,6 +26,9 @@ Local helpers from the 2026-11-02 session. Paths are hard-coded for this machine
 | `cmpgroups.py START END A_LOG[,…] B_LOG[,…] [TOP]` | Mean per-second counters of two groups of runs over a window, sorted by difference. |
 | `phasecost.py LOG NAME:START-END…` | Per-frame and per-draw cost of each Ns counter for named time windows of one run. |
 | `timeline.py LOG START END` | Second-by-second transition timeline (flips, draws/frame, PM4, compiles, waits, uploads). |
+| `prewalkrun.py LOG…` | Look-ahead helper runs: share of materializations taken and why the rest missed, helper jobs/time, verify mismatches. |
+| `abphases.py LOG…` | In-run A/B by window (intro, heavy seconds, early play): µs per draw, FPS, GPU-/game-thread time sinks. Pool runs by passing several logs. |
+| `prewalk.py LOG…` | `KYTY_PREWALK_PROBE=1` runs: share of materialization time a slice-start walk would match, by category and ineligibility reason (doc part 13). |
 | `intro.py LOG…` | Per run: FPS, worst second, draws per frame and µs per draw for the pre-game intro (t 70–106), its >4,500-draw seconds and early play (t 115–128). |
 | `rbattr.py LOG START END` | Readback time by PM4 opcode (`rbopXX`). |
 | `nsys-capture.ps1` | Nsight Systems CPU sampling + Vulkan trace. Needs an elevated PowerShell (the user approved this). |
@@ -59,6 +62,13 @@ SRT walker (descriptor materialization JIT, `SrtWalker.cpp`):
   prefetches of walkers that need more (then none, as before).
 - `KYTY_PRESENT_QUEUE=0`: present on the main queue (default: a separate queue).
 
+Look-ahead materialization helper (2026-11-07 part 14, on by default; doc part 14):
+
+- `KYTY_PREWALK=0` disables it. `KYTY_PREWALK_VERIFY=1` recomputes every taken result on the GPU
+  thread (`PrewalkVerifyMismatches`, `Prewalk MISMATCH` lines); `KYTY_PREWALK_DIAGNOSE=1` prints
+  mispredicted user data. `KYTY_PREWALK_PROBE=1` is the part-13 feasibility probe.
+- `KYTY_AB_TARGET=<name>[,…]` makes only the named features follow `KYTY_AB_PERIOD` (`prewalk`,
+  `texmemo`, `rtmemo`, `bdaslice`); without it every A/B feature toggles together.
 
 Texture-cache lookup memos (2026-11-07 part 12, on by default, follow `KYTY_AB_PERIOD`):
 

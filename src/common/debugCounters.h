@@ -74,6 +74,44 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::i
 	X(TextureMemoMismatches) /* KYTY_TEXTURE_MEMO_VERIFY=1: memo differs from a full resolve. */ \
 	X(TargetMemoHits) /* Render-target memo reused its image without FindImage (part 12). */ \
 	X(TargetMemoMisses) \
+	X(PrewalkValid) /* KYTY_PREWALK_PROBE=1: materializations a slice-start walk would match. */ \
+	X(PrewalkValidNs) \
+	X(PrewalkIneligible) /* reads beyond the walked tables (indirect, captured, selector, calls) */ \
+	X(PrewalkIneligibleNs) \
+	X(PrewalkFaulted) /* a walker load faulted (GPU-modified page at walk time) */ \
+	X(PrewalkFaultedNs) \
+	X(PrewalkSliceWritten) /* read a page the GPU thread changed earlier in the slice */ \
+	X(PrewalkSliceWrittenNs) \
+	X(PrewalkNoWalkerNs) /* ineligible by reason (first that applies): no walker/incomplete */ \
+	X(PrewalkCapturedReadsNs) /* capture_specialization_reads */ \
+	X(PrewalkSourceReadsNs) /* GPU-selected call sources */ \
+	X(PrewalkSelectorKeysNs) \
+	X(PrewalkIndirectNs) /* indirect descriptors (tables addressed by walked values) */ \
+	X(PrewalkTaken) /* KYTY_PREWALK=1: materializations answered by the look-ahead helper */ \
+	X(PrewalkNoMatch) /* no helper result for this program/user data in the search window */ \
+	X(PrewalkNoMatchEmpty) /* ... the helper had produced nothing past the cursor */ \
+	X(PrewalkNoMatchProgram) /* ... no result for this program in the window */ \
+	X(PrewalkNoMatchUserData) /* ... same program, other user data or base */ \
+	X(PrewalkNotReady) /* matched, but the helper had not finished it */ \
+	X(PrewalkFailed) /* matched, but the helper's materialization failed or was skipped */ \
+	X(PrewalkRejected) /* matched, but a read lies on memory changed in the slice */ \
+	X(PrewalkVerifyMismatches) /* KYTY_PREWALK_VERIFY=1: taken result differs from a fresh one */ \
+	X(PrewalkJobs) /* programs the helper predicted */ \
+	X(PrewalkHelperBatches) \
+	X(PrewalkHelperNs) /* helper thread busy time */ \
+	X(PrewalkHelperFailed) \
+	X(PrewalkHelperSkipped) /* jobs the helper skipped: the GPU thread was already past them */ \
+	X(PrewalkHelperGpuDirty) /* helper result read GPU-written bytes not yet in guest memory */ \
+	X(PrewalkScanStops) /* register replay stopped at a branch, COND_EXEC or unreadable table */ \
+	X(PrewalkScanWaits) /* register replay stopped at a wait not yet satisfied */ \
+	X(PrewalkScanFences) /* ... passed: its label is written by an earlier packet of the slice */ \
+	X(PrewalkScanLost) /* register replay hit a malformed packet */ \
+	X(PrewalkEmits) /* programs the replay found at draws/dispatches */ \
+	X(PrewalkEmitUnpublished) /* ... no program published for that stage and address */ \
+	X(PrewalkEmitIneligible) \
+	X(PrewalkEmitCount) /* ... user SGPR count does not match the published program's */ \
+	X(PrewalkCapturedPlans) /* captured-read plans (no calls/selectors), all of their reads known */ \
+	X(PrewalkCapturedValidNs) /* ... of those: no fault and no recorded read changed in the slice */ \
 	X(AgcHelperPackets) /* Packets produced through native Graphics5 command-buffer helpers. */ \
 	X(AgcHelperDwords) \
 	X(AgcDcbSubmits) /* Guest graphics command-buffer submissions. */ \
@@ -451,6 +489,14 @@ inline std::atomic<bool> g_ab_variant {true};
 
 [[nodiscard]] inline bool AbVariant() noexcept {
 	return Detail::g_ab_variant.load(std::memory_order_relaxed);
+}
+
+// KYTY_AB_TARGET=<name>[,<name>…]: only the named features follow the A/B; the others stay on.
+// Names: prewalk, texmemo, rtmemo, bdaslice. Without the variable every feature follows it.
+[[nodiscard]] inline bool AbVariantFor(const char* name) noexcept {
+	static const char* target = std::getenv("KYTY_AB_TARGET");
+	if (target == nullptr || std::strstr(target, name) != nullptr) return AbVariant();
+	return true;
 }
 
 // When KYTY_PERF_CSV names a file, enables collection and appends one line of per-second
